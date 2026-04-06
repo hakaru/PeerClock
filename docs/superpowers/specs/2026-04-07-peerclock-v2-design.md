@@ -1,52 +1,66 @@
-# PeerClock v2 Design — Transport-First Architecture
+# PeerClock v2 Design — Peer-Equal Architecture
 
 ## Overview
 
-PeerClock を「クロック同期ライブラリ」から「ピアツーピア・デバイス連携基盤」に進化させる。クロック同期に加え、汎用コマンドチャネルとステータス共有を提供し、1Take をはじめとする任意のアプリがデバイス間の協調動作を構築できるインフラ層となる。
+PeerClock は Apple デバイス間の対等ピアツーピア連携基盤。クロック同期・汎用コマンドチャネル・ステータス共有を提供し、任意のアプリがデバイス間の協調動作を構築できるインフラ層となる。
+
+**差別化**: iOS/macOS エコシステムに「対等ピア・クロック同期 + コマンド/ステータス統合基盤」は存在しない（2026-04 時点の調査結果）。既存の NTP クライアント（TrueTime, Kronos）は外部サーバー向け、P2P フレームワーク（PeerKit, sReto）はクロック同期なし。
+
+## Design Principles
+
+- **全ノード対等**: Role の概念を公開 API に露出しない。どのデバイスからでもコマンド送信・ステータス監視が可能
+- **内部 coordinator は透過的**: クロック同期に必要な基準時計は自動選出。アプリは意識しない
+- **インフラに徹する**: PeerClock はコマンドのセマンティクスを知らない。アプリが定義する
+- **境界に Protocol、即座に実装**: テスタビリティと将来の差し替えを確保。実装のないプロトコルは作らない
 
 ## Design Decisions
 
 | 決定事項 | 選択 | 理由 |
 |---|---|---|
-| パッケージ構成 | 1パッケージ | 現段階では分離の必要なし。必要になったら分割 |
-| アーキテクチャ | トランスポートファースト（B） | 全機能が同じ基盤に自然に載る |
-| プロトコル抽象 | 境界にだけ Protocol、即座に実装 | テスタビリティ + 将来の差し替え。YAGNI を守る |
-| マスター/スレーブ vs 対等ピア | マスター/スレーブで開始、最終形は対等ピア | Phase 4 で探索。進化の余地を残す |
+| パッケージ構成 | 1パッケージ | 現段階では分離の必要なし |
+| トポロジ | 対等ピア（公開 API に role なし） | 尖った設計。競合なし。最初から対等 |
+| Coordinator 選出 | 自動（Phase 1: 最小 PeerID） | 公開 API に露出しない内部メカニズム |
 | コマンドチャネル | 汎用（アプリがセマンティクス定義） | 1Take 以外のアプリにも使える |
 | ステータス共有 | プッシュ + プル両対応 | 共通ステータス（`pc.*`）+ カスタムステータス |
+| ステータス鮮度管理 | 世代番号（monotonic counter） | 再接続時の新旧判定に使用 |
 | ワイヤプロトコル | トランスポート非依存の論理メッセージ | reliable / unreliable チャネルで抽象化 |
 | ハートビート | Configuration で調整可能 + degraded 状態 | デフォルト値は実機テストで決定 |
+| request/response 相関 | 2-byte 相関 ID | Codex レビュー指摘を反映 |
 
 ---
 
 ## Component Architecture
 
 ```
-PeerClock (Public Facade)
+PeerClock (Public Facade — role-free)
 │
 ├── Protocols/
-│   ├── Transport        (reliable + unreliable チャネル)
-│   ├── SyncEngine       (クロック同期)
-│   ├── CommandHandler   (コマンド処理)
-│   └── StatusProvider   (ステータス提供)
+│   ├── Transport          (reliable + unreliable チャネル)
+│   ├── SyncEngine         (クロック同期)
+│   ├── CommandHandler     (コマンド処理)
+│   └── StatusProvider     (ステータス提供)
 │
 ├── Transport/
-│   ├── Discovery        (Bonjour: NWBrowser / NWListener)
-│   └── WiFiTransport    (impl: Transport — UDP unreliable, TCP reliable)
+│   ├── Discovery          (Bonjour: 全ノードが browse + advertise)
+│   └── WiFiTransport      (impl: Transport — UDP unreliable, TCP reliable)
+│
+├── Coordination/
+│   ├── CoordinatorElection(自動選出 — 最小 PeerID)
+│   └── ElectionProtocol   (選出・降格・昇格メッセージ)
 │
 ├── ClockSync/
-│   ├── NTPSyncEngine    (impl: SyncEngine — 4-timestamp + best-half)
-│   └── DriftMonitor     (周期再同期、ジャンプ検出)
+│   ├── NTPSyncEngine      (impl: SyncEngine — 4-timestamp + best-half)
+│   └── DriftMonitor       (周期再同期、ジャンプ検出)
 │
 ├── Command/
-│   ├── CommandRouter    (impl: CommandHandler — 送信/受信/ルーティング)
-│   └── CommandCodec     (シリアライズ/デシリアライズ)
+│   ├── CommandRouter      (impl: CommandHandler — 送信/受信/ルーティング)
+│   └── CommandCodec       (シリアライズ/デシリアライズ)
 │
 ├── Status/
-│   ├── StatusRegistry   (impl: StatusProvider — 共通+カスタム管理)
-│   └── StatusBroadcaster(変化検知 + ブロードキャスト + リクエスト応答)
+│   ├── StatusRegistry     (impl: StatusProvider — 共通+カスタム管理)
+│   └── StatusBroadcaster  (変化検知 + ブロードキャスト + リクエスト応答)
 │
-└── EventScheduler/      (Phase 2)
+└── EventScheduler/        (Phase 2)
     └── mach_absolute_time ベースの精密発火
 ```
 
@@ -55,6 +69,7 @@ PeerClock (Public Facade)
 ```
 Sources/PeerClock/
 ├── PeerClock.swift
+├── Types.swift
 ├── Protocols/
 │   ├── Transport.swift
 │   ├── SyncEngine.swift
@@ -63,6 +78,9 @@ Sources/PeerClock/
 ├── Transport/
 │   ├── Discovery.swift
 │   └── WiFiTransport.swift
+├── Coordination/
+│   ├── CoordinatorElection.swift
+│   └── ElectionProtocol.swift
 ├── ClockSync/
 │   ├── NTPSyncEngine.swift
 │   └── DriftMonitor.swift
@@ -77,15 +95,53 @@ Sources/PeerClock/
 
 ---
 
+## Coordinator Election（内部メカニズム）
+
+対等ピアでも、クロック同期には「基準時計」が1つ必要。これを内部で自動選出する。
+
+### 選出ルール（Phase 1）
+
+```
+1. 各ピアがユニークな PeerID を持つ（UUID ベース、セッション内で固定）
+2. 接続確立時に全ピアが PeerID を交換
+3. 最小 PeerID のノードが sync coordinator に
+4. Coordinator が離脱 → 残りの中で最小 PeerID が自動昇格
+5. 新ノード参加 → PeerID が最小なら coordinator 交代
+```
+
+### 公開 API への影響
+
+**なし。** アプリは coordinator の存在を知らない。`PeerClock.now` は誰が coordinator かに関係なく同期済み時刻を返す。
+
+### 将来の進化（Phase 4+）
+
+- 合議ベースの同期（全ペア間で相互測定、中央値を基準）
+- ネットワーク品質ベースの選出（最も安定した接続のノードが coordinator）
+- 選出アルゴリズムは `CoordinatorElection` に閉じ込められているため差し替え可能
+
+---
+
 ## Core Protocols
 
 ```swift
 protocol Transport: Sendable {
+    /// 低レイテンシ、ロス許容（クロック同期用）
     func sendUnreliable(_ data: Data, to peer: PeerID) async throws
     var unreliableMessages: AsyncStream<(PeerID, Data)> { get }
-    
+
+    /// 到達保証（コマンド・ステータス用）
     func sendReliable(_ data: Data, to peer: PeerID) async throws
     var reliableMessages: AsyncStream<(PeerID, Data)> { get }
+
+    /// 接続ライフサイクル
+    var connectionEvents: AsyncStream<ConnectionEvent> { get }
+}
+
+enum ConnectionEvent: Sendable {
+    case peerJoined(PeerID)
+    case peerLeft(PeerID)
+    case transportDegraded(PeerID)
+    case transportRestored(PeerID)
 }
 
 protocol SyncEngine: Sendable {
@@ -110,27 +166,27 @@ protocol StatusProvider: Sendable {
 
 ```swift
 public final class PeerClock: Sendable {
-    // 初期化
-    public init(role: Role, configuration: Configuration = .default)
-    
-    // 接続ライフサイクル
-    public func start() async throws
+    /// 対等ピアとして初期化。Role の指定は不要。
+    public init(configuration: Configuration = .default)
+
+    // --- 接続ライフサイクル ---
+    public func start() async throws    // Discovery + 接続 + 自動 coordinator 選出 + 同期開始
     public func stop() async
-    
-    // クロック同期
-    public var now: UInt64 { get }
-    public var syncState: AsyncStream<SyncState> { get }
-    
-    // ピア情報
-    public var peers: AsyncStream<[Peer]> { get }
-    
-    // コマンド（汎用チャネル）
-    public func send(_ command: Command, to: PeerID) async throws
-    public func send(_ command: Command, toAll: Bool) async throws
+
+    // --- クロック同期 ---
+    public var now: UInt64 { get }                      // 同期済みナノ秒タイムスタンプ
+    public var syncState: AsyncStream<SyncState> { get } // idle → syncing → synced → ...
+
+    // --- ピア情報 ---
+    public var peers: AsyncStream<[Peer]> { get }       // 接続中ピア一覧（フラット、階層なし）
+
+    // --- コマンド（汎用チャネル） ---
+    public func send(_ command: Command, to peer: PeerID) async throws
+    public func broadcast(_ command: Command) async throws
     public var commands: AsyncStream<(PeerID, Command)> { get }
-    
-    // ステータス
-    public func registerStatus(_ value: any Codable & Sendable, forKey: String)
+
+    // --- ステータス ---
+    public func setStatus(_ value: any Codable & Sendable, forKey key: String)
     public func status(of peer: PeerID) -> PeerStatus?
     public var statusUpdates: AsyncStream<(PeerID, PeerStatus)> { get }
 }
@@ -139,11 +195,13 @@ public final class PeerClock: Sendable {
 ### Types
 
 ```swift
-public enum Role: Sendable { case master, slave }
+public struct PeerID: Hashable, Sendable, Comparable {
+    public let rawValue: UUID
+}
 
 public struct Command: Sendable {
-    public let type: String
-    public let payload: Data
+    public let type: String     // アプリが定義する任意の識別子（例: "com.1take.record.start"）
+    public let payload: Data    // アプリが定義する任意のペイロード
 }
 
 public struct PeerStatus: Sendable {
@@ -151,28 +209,86 @@ public struct PeerStatus: Sendable {
     public let connectionState: ConnectionState
     public let syncQuality: SyncQuality?
     public let deviceInfo: DeviceInfo
-    public let custom: [String: Data]
+    public let custom: [String: Data]           // アプリ定義のカスタムステータス
+    public let generation: UInt64               // 世代番号（新旧判定用）
 }
 
-public struct Peer: Sendable {
+public struct Peer: Sendable, Identifiable {
     public let id: PeerID
     public let name: String
-    public let role: Role
     public let status: PeerStatus
+    // role なし — 全ピアが対等
 }
 
 public enum ConnectionState: Sendable {
     case connected
-    case degraded    // ハートビート不安定
+    case degraded       // ハートビート不安定
     case disconnected
+}
+
+public enum SyncState: Sendable {
+    case idle
+    case discovering
+    case syncing
+    case synced(offset: TimeInterval, quality: SyncQuality)
+    case error(String)
+}
+
+public struct SyncQuality: Sendable {
+    public let offsetNs: Int64          // ナノ秒
+    public let roundTripDelayNs: UInt64 // ナノ秒
+    public let confidence: Double       // 0.0 - 1.0
+}
+
+public struct DeviceInfo: Sendable {
+    public let name: String
+    public let platform: Platform       // .iOS, .macOS
+    public let batteryLevel: Double?    // 0.0 - 1.0, macOS は nil
+    public let storageAvailable: UInt64 // bytes
+}
+
+public enum Platform: Sendable {
+    case iOS
+    case macOS
 }
 
 public struct Configuration: Sendable {
     public var heartbeatInterval: TimeInterval = 1.0
     public var disconnectThreshold: Int = 3
-    // その他パラメータは実装時に追加
-    
+    public var syncInterval: TimeInterval = 5.0
+    public var syncMeasurements: Int = 40
+    public var syncMeasurementInterval: TimeInterval = 0.03
+    public var serviceName: String = "_peerclock._udp"
+
     public static let `default` = Configuration()
+}
+```
+
+### Usage Example (1Take)
+
+```swift
+// 全デバイスで同じコード — role の区別なし
+let clock = PeerClock()
+try await clock.start()
+
+// ピアが見つかるのを待つ
+for await peers in clock.peers {
+    if peers.count >= 2 { break }
+}
+
+// 全デバイスに録音開始コマンド
+try await clock.broadcast(
+    Command(type: "com.1take.record.start", payload: config.encoded())
+)
+
+// 同期済み時刻で録音タイムスタンプを記録
+let timestamp = clock.now
+
+// 各デバイスのカスタムステータスを監視
+for await (peerID, status) in clock.statusUpdates {
+    if let storage = status.custom["com.1take.storage.remaining"] {
+        // ストレージ残量を UI に表示
+    }
 }
 ```
 
@@ -183,30 +299,41 @@ public struct Configuration: Sendable {
 ### 論理メッセージフォーマット（トランスポート非依存）
 
 ```
-┌─────────┬──────────┬──────────┬─────────────┐
-│ Version │ Category │ Length   │ Payload     │
-│ 1 byte  │ 1 byte   │ 2 bytes  │ N bytes     │
-└─────────┴──────────┴──────────┴─────────────┘
+┌─────────┬──────────┬──────────┬──────────┬─────────────┐
+│ Version │ Category │ Flags    │ Length   │ Payload     │
+│ 1 byte  │ 1 byte   │ 1 byte   │ 2 bytes  │ N bytes     │
+└─────────┴──────────┴──────────┴──────────┴─────────────┘
 ```
+
+- **Version**: プロトコルバージョン（初期値 `0x01`）
+- **Category**: メッセージ種別
+- **Flags**: 拡張用予約（Codex レビュー指摘を反映。初期値 `0x00`）
+- **Length**: ペイロード長（2 bytes, big-endian, 最大 65535 bytes）
+- **Payload**: 可変長。整数は全て big-endian。文字列は UTF-8。
 
 #### Unreliable チャネル（クロック同期）
 
-| Category | 名前 | 方向 |
+方向非依存 — どのピアからでも送受信可能。
+
+| Category | 名前 | 用途 |
 |---|---|---|
-| 0x01 | PING | slave → master (carries t0) |
-| 0x02 | PONG | master → slave (carries t1, t2) |
+| 0x01 | SYNC_REQUEST | 同期要求（t0 を含む） |
+| 0x02 | SYNC_RESPONSE | 同期応答（t0, t1, t2 を含む） |
 
-ペイロード: 24 bytes（UInt64 × 3 タイムスタンプ、mach_continuous_time ナノ秒）
+ペイロード: 24 bytes（UInt64 × 3 タイムスタンプ、mach_continuous_time ナノ秒、big-endian）
 
-#### Reliable チャネル（コマンド・ステータス）
+Coordinator が SYNC_REQUEST を受け取り SYNC_RESPONSE を返す。どのノードが coordinator かはアプリから不可視。
+
+#### Reliable チャネル（コマンド・ステータス・選出）
 
 | Category | 名前 | 用途 |
 |---|---|---|
 | 0x10 | SYSTEM_COMMAND | HEARTBEAT, DISCONNECT, DEVICE_INFO |
+| 0x11 | ELECTION | Coordinator 選出メッセージ |
 | 0x20 | APP_COMMAND | 汎用コマンド |
 | 0x30 | STATUS_PUSH | ステータスブロードキャスト |
-| 0x31 | STATUS_REQUEST | ステータスリクエスト |
-| 0x32 | STATUS_RESPONSE | ステータス応答 |
+| 0x31 | STATUS_REQUEST | ステータスリクエスト（相関 ID 付き） |
+| 0x32 | STATUS_RESPONSE | ステータス応答（相関 ID 付き） |
 
 #### APP_COMMAND ペイロード
 
@@ -217,14 +344,33 @@ public struct Configuration: Sendable {
 └────────────┴──────────────┴──────────────┘
 ```
 
-#### STATUS ペイロード
+- `type.len`: 2 bytes, big-endian
+- `type`: UTF-8 文字列
+- `payload`: 残りバイト列（アプリが自由に定義）
+
+#### STATUS_REQUEST / STATUS_RESPONSE ペイロード
 
 ```
-┌──────────┬───────────────────────────────────┐
-│ entries  │ [key.len + key + value.len + value]│
-│ 2 bytes  │ 繰り返し                           │
-└──────────┴───────────────────────────────────┘
+┌──────────────┬──────────────┐
+│ correlation  │ body         │
+│ 2 bytes      │ 残り全部     │
+└──────────────┴──────────────┘
 ```
+
+- `correlation`: 2 bytes, big-endian。リクエストとレスポンスの紐付け用。
+
+#### STATUS_PUSH / STATUS_RESPONSE body
+
+```
+┌──────────┬────────────┬───────────────────────────────────────────────┐
+│ entries  │ generation │ [key.len(2) + key(UTF-8) + value.len(2) + value] │
+│ 2 bytes  │ 8 bytes    │ 繰り返し                                      │
+└──────────┴────────────┴───────────────────────────────────────────────┘
+```
+
+- `entries`: エントリ数（2 bytes, big-endian）
+- `generation`: 世代番号（8 bytes, big-endian, monotonic counter）
+- 各エントリ: `key.len`(2) + `key`(UTF-8) + `value.len`(2) + `value`(bytes)
 
 ### ステータスキー名前空間
 
@@ -247,12 +393,13 @@ public struct Configuration: Sendable {
 ### プッシュ（自動）
 
 状態変化時に StatusBroadcaster が reliable チャネルで全ピアに STATUS_PUSH を送信。
-- 共通ステータス: PeerClock が自動プッシュ
-- カスタムステータス: アプリが `registerStatus(_:forKey:)` を呼ぶたびにプッシュ
+- 共通ステータス（`pc.*`）: PeerClock が自動プッシュ
+- カスタムステータス: アプリが `setStatus(_:forKey:)` を呼ぶたびにプッシュ
+- 高頻度更新に対する debounce: 同一キーの更新が 100ms 以内に連続した場合、最後の値だけ送信（Configuration で調整可能）
 
 ### プル（オンデマンド）
 
-`status(of:)` 呼び出し時、キャッシュが古ければ STATUS_REQUEST → STATUS_RESPONSE。
+`status(of:)` 呼び出し時、キャッシュがあればそれを返す。キャッシュの鮮度は `generation` で判定。STATUS_REQUEST に `correlation` ID を付与し、STATUS_RESPONSE で紐付ける。
 
 ### 切断検知
 
@@ -263,28 +410,29 @@ connected ──(1回ミス)──→ degraded ──(閾値超え)──→ dis
 ```
 
 - `degraded`: アプリに通知、切断はしない（アプリ側で判断可能）
-- `disconnected`: 再接続フローに入る
+- `disconnected`: 再接続フローに入る。coordinator だった場合は自動で再選出
 - RemoteStatusStore のエントリは保持（最後の既知状態）、stale フラグ付き
-- 再接続時にフルステータス交換で同期
+- 再接続時にフルステータス交換（`generation` 比較で新旧判定）
 - **ハートビートのデフォルト値（間隔・閾値）は Phase 1 の実機テストで決定**
 
 ---
 
 ## Phases
 
-### Phase 1: トランスポート + クロック同期 + 基本コマンド
+### Phase 1: トランスポート + クロック同期 + コマンド
 
-- `Transport` プロトコル + `WiFiTransport` 実装
-- Bonjour ディスカバリ（master/slave）
+- `Transport` プロトコル + `WiFiTransport` 実装（reliable / unreliable + connectionEvents）
+- Bonjour ディスカバリ（全ノードが browse + advertise）
+- `CoordinatorElection`: 最小 PeerID 自動選出
 - `NTPSyncEngine`: 4-timestamp exchange + best-half filtering + 周期再同期
-- `CommandChannel`: 汎用コマンド送受信
-- `PeerClock` facade（start/stop/now/send/commands）
+- `CommandChannel`: 汎用コマンド送受信（broadcast 含む）
+- `PeerClock` facade（role-free API）
 - `MockTransport` によるユニットテスト
-- 実機2台でクロック同期 + コマンド送受信の動作確認
+- 実機2台で動作確認
 
 ### Phase 2: ステータス + イベントスケジューリング
 
-- `StatusRegistry` + `StatusBroadcaster`
+- `StatusRegistry` + `StatusBroadcaster`（世代番号、debounce）
 - ハートビート + connected/degraded/disconnected 状態遷移
 - `EventScheduler`: mach_absolute_time ベース精密発火
 - 実機テストでハートビートのデフォルト値を決定
@@ -293,12 +441,13 @@ connected ──(1回ミス)──→ degraded ──(閾値超え)──→ dis
 
 - `MultipeerTransport: Transport`
 - 自動トランスポート切替
-- 再接続ロジック
+- 再接続ロジック + coordinator 再選出
 - バックグラウンドモード
 
-### Phase 4: 対等ピア探索
+### Phase 4: 高度な同期
 
-- マルチマスター選出 / 対等ピアモデルの実験
+- 合議ベースの同期アルゴリズム（全ペア間相互測定）
+- ネットワーク品質ベースの coordinator 選出
 - クロック品質メトリクス
 - 超音波同期マーカー
 - watchOS
@@ -307,12 +456,33 @@ connected ──(1回ミス)──→ degraded ──(閾値超え)──→ dis
 
 ---
 
-## Relation to Existing DESIGN.md
+## Clock Sync Algorithm（DESIGN.md より継承）
 
-この設計は `docs/DESIGN.md` を置き換えるものではなく、拡張する。DESIGN.md のクロック同期アルゴリズム、ドリフト分析、障害モード、セキュリティ考慮、プラットフォーム要件はそのまま有効。本ドキュメントは以下を追加:
+- NTP 風 4 タイムスタンプ交換: offset = (t1-t0 + t2-t3) / 2
+- 30ms 間隔で 40 回測定（初期同期 ~1.2 秒）
+- RTT でソートし上位 50% を採用（best-half filtering）
+- 5 秒ごとに再同期（水晶発振子ドリフト 20-50ppm 対策）
+- オフセット差 >10ms で完全再同期
+- 対等ピアでは coordinator がタイムスタンプ応答を担当
 
-- トランスポート抽象化（Protocol ベース）
-- 汎用コマンドチャネル
-- ステータス共有（プッシュ + プル）
-- 改訂フェーズ構成
-- 拡張ワイヤプロトコル
+## Security
+
+- ローカルネットワーク限定（インターネット非露出）
+- v1 では暗号化なし（信頼できるローカルネットワーク前提）
+- iOS Local Network permission 必要（`NSLocalNetworkUsageDescription`）
+- `NSBonjourServices: ["_peerclock._udp"]`
+
+## Platform Requirements
+
+- iOS 17.0+ / macOS 14+
+- Swift 6.0+（strict concurrency）
+- Network.framework
+
+## Competitive Landscape (2026-04)
+
+| カテゴリ | プロジェクト | PeerClock との違い |
+|---|---|---|
+| NTP クライアント | TrueTime, Kronos, swift-ntp | 外部サーバー向け。ピア間同期なし |
+| P2P 通信 | PeerKit, sReto, P2PShareKit | 通信のみ。クロック同期なし |
+| 音楽向け同期 | TheSpectacularSyncEngine | MIDI 特化、マスター/スレーブ固定 |
+| **PeerClock** | — | **対等ピア + クロック同期 + コマンド/ステータス統合。唯一。** |
