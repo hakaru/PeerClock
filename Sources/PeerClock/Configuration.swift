@@ -47,6 +47,23 @@ public struct Configuration: Sendable {
     /// 各段階で次の段階へ昇格するために必要な連続成功回数。
     public let syncBackoffPromoteAfter: Int
 
+    /// schedule() がガードする最小同期信頼度 (0.0..1.0)。
+    /// `quality.confidence < minSyncQuality` の場合 `qualityBelowThreshold` を throw。
+    /// 比較は厳密未満なので `==` は通過する。
+    public let minSyncQuality: Double
+
+    /// SyncSnapshot.isSynchronized が true となる最終同期からの最大経過時間。
+    /// デフォルト 90 秒 (Phase 3.5 のバックオフ最大 30s × 2 + マージン)。
+    public let syncStaleAfter: Duration
+
+    /// 内部用: syncStaleAfter のナノ秒換算
+    internal var syncStaleAfterNs: UInt64 {
+        let comps = syncStaleAfter.components
+        let secNs = UInt64(max(0, comps.seconds)) * 1_000_000_000
+        let attoNs = UInt64(max(0, comps.attoseconds / 1_000_000_000))
+        return secNs &+ attoNs
+    }
+
     /// Number of timing measurements per sync round.
     public let syncMeasurements: Int
 
@@ -78,6 +95,8 @@ public struct Configuration: Sendable {
         syncInterval: TimeInterval = 5.0,
         syncBackoffStages: [TimeInterval] = [5.0, 10.0, 20.0, 30.0],
         syncBackoffPromoteAfter: Int = 3,
+        minSyncQuality: Double = 0.5,
+        syncStaleAfter: Duration = .seconds(90),
         syncMeasurements: Int = 40,
         syncMeasurementInterval: TimeInterval = 0.03,
         mcServiceType: String = "peerclock-mpc",
@@ -95,6 +114,8 @@ public struct Configuration: Sendable {
         self.syncInterval = syncInterval
         self.syncBackoffStages = syncBackoffStages
         self.syncBackoffPromoteAfter = syncBackoffPromoteAfter
+        self.minSyncQuality = minSyncQuality
+        self.syncStaleAfter = syncStaleAfter
         self.syncMeasurements = syncMeasurements
         self.syncMeasurementInterval = syncMeasurementInterval
         self.mcServiceType = mcServiceType
