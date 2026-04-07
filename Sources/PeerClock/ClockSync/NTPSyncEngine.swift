@@ -11,7 +11,7 @@ import Darwin
 /// 1. `syncMeasurements` 回の SYNC_REQUEST を送信し SYNC_RESPONSE を収集する
 /// 2. 遅延 (delay) でソートして下位50%を選別 (bestHalfFilter)
 /// 3. 残った測定値の平均オフセットを計算し currentOffset に反映する
-/// 4. `syncInterval` 秒待機して繰り返す
+/// 4. BackoffController が決定する次の interval だけ待機して繰り返す
 public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
 
     // MARK: - Properties
@@ -25,6 +25,8 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
     /// ロック保護されたクロックオフセット (秒単位)
     private let lock = NSLock()
     private var _currentOffset: TimeInterval = 0.0
+    /// Backoff controller (lock 配下)
+    private var backoff: BackoffController
 
     public var currentOffset: TimeInterval {
         lock.withLock { _currentOffset }
@@ -52,6 +54,10 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
         self.localPeerID = localPeerID
         self.configuration = configuration
         self.syncMessageStream = syncMessageStream
+        self.backoff = BackoffController(
+            stages: configuration.syncBackoffStages,
+            promoteAfter: configuration.syncBackoffPromoteAfter
+        )
 
         var continuation: AsyncStream<SyncState>.Continuation!
         self.syncStateUpdates = AsyncStream { continuation = $0 }
@@ -64,6 +70,7 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
         lock.withLock {
             self.coordinatorID = coordinator
             self._currentOffset = 0.0
+            self.backoff.reset()
         }
         syncStateContinuation.yield(.syncing)
 
@@ -87,6 +94,11 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
         // PeerClock がフォロワー切り替え時に stop() → start() を連続呼びするため
     }
 
+    /// 外部 (PeerClock Facade が DriftMonitor jump を検出時など) からバックオフを初期段階に戻す。
+    public func resetBackoff() {
+        lock.withLock { self.backoff.reset() }
+    }
+
     // MARK: - Core Loop
 
     private func runSyncLoop() async {
@@ -95,29 +107,35 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
 
             let measurements = await collectMeasurements(coordinator: coordinatorID)
 
-            guard !measurements.isEmpty else {
-                // 測定失敗 — 次のサイクルへ
-                try? await Task.sleep(for: .seconds(configuration.syncInterval))
-                continue
+            let interval: TimeInterval
+            if measurements.isEmpty {
+                interval = lock.withLock {
+                    self.backoff.recordFailure()
+                    return self.backoff.currentInterval
+                }
+            } else {
+                let filtered = NTPSyncEngine.bestHalfFilter(measurements)
+                let offsetNs = NTPSyncEngine.meanOffset(filtered)
+                let offsetSeconds = offsetNs / 1_000_000_000.0
+
+                lock.withLock { self._currentOffset = offsetSeconds }
+
+                let bestDelay = filtered.min(by: { $0.delay < $1.delay })?.delay ?? 0
+                let quality = SyncQuality(
+                    offsetNs: Int64(offsetNs),
+                    roundTripDelayNs: bestDelay,
+                    confidence: min(1.0, Double(filtered.count) / Double(configuration.syncMeasurements))
+                )
+                syncStateContinuation.yield(.synced(offset: offsetSeconds, quality: quality))
+
+                interval = lock.withLock {
+                    self.backoff.recordSuccess()
+                    return self.backoff.currentInterval
+                }
             }
 
-            let filtered = NTPSyncEngine.bestHalfFilter(measurements)
-            let offsetNs = NTPSyncEngine.meanOffset(filtered)
-            let offsetSeconds = offsetNs / 1_000_000_000.0
-
-            lock.withLock { self._currentOffset = offsetSeconds }
-
-            // 代表的な quality 情報を生成 (最速の1件を使用)
-            let bestDelay = filtered.min(by: { $0.delay < $1.delay })?.delay ?? 0
-            let quality = SyncQuality(
-                offsetNs: Int64(offsetNs),
-                roundTripDelayNs: bestDelay,
-                confidence: min(1.0, Double(filtered.count) / Double(configuration.syncMeasurements))
-            )
-            syncStateContinuation.yield(.synced(offset: offsetSeconds, quality: quality))
-
             do {
-                try await Task.sleep(for: .seconds(configuration.syncInterval))
+                try await Task.sleep(for: .seconds(interval))
             } catch {
                 break
             }
