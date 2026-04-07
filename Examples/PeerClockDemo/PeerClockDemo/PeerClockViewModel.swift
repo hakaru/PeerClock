@@ -32,6 +32,13 @@ final class PeerClockViewModel {
         let payload: String
     }
 
+    struct RemotePeerView: Identifiable {
+        let id: PeerID
+        let name: String
+        let connectionState: ConnectionState
+        let statusSummary: String
+    }
+
     private(set) var runState: RunState = .stopped
     private(set) var localPeerID: String = "-"
     private(set) var coordinatorLabel: String = "none"
@@ -41,6 +48,7 @@ final class PeerClockViewModel {
     private(set) var syncConfidence: Double = 0
     private(set) var syncRoundTripMs: Double = 0
     private(set) var peers: [String] = []
+    private(set) var remotePeers: [RemotePeerView] = []
     private(set) var logs: [LogEntry] = []
     private(set) var commandLog: [CommandLogEntry] = []
 
@@ -51,6 +59,8 @@ final class PeerClockViewModel {
     private var peersTask: Task<Void, Never>?
     private var commandsTask: Task<Void, Never>?
     private var coordinatorPollTask: Task<Void, Never>?
+    private var statusTask: Task<Void, Never>?
+    private var connectionTask: Task<Void, Never>?
 
     // MARK: - Lifecycle
 
@@ -103,6 +113,20 @@ final class PeerClockViewModel {
                 try? await Task.sleep(for: .milliseconds(500))
             }
         }
+
+        statusTask = Task { [weak self] in
+            guard let self, let clock = await self.clock else { return }
+            for await snapshot in clock.statusUpdates {
+                await self.handleStatus(snapshot)
+            }
+        }
+
+        connectionTask = Task { [weak self] in
+            guard let self, let clock = await self.clock else { return }
+            for await event in clock.connectionEvents {
+                await self.handleConnection(event)
+            }
+        }
     }
 
     func stop() async {
@@ -110,9 +134,12 @@ final class PeerClockViewModel {
         peersTask?.cancel()
         commandsTask?.cancel()
         coordinatorPollTask?.cancel()
+        statusTask?.cancel()
+        connectionTask?.cancel()
         await clock?.stop()
         clock = nil
         runState = .stopped
+        remotePeers = []
         appendLog("Stopped.")
     }
 
@@ -170,6 +197,11 @@ final class PeerClockViewModel {
 
     private func handlePeers(_ newPeers: [Peer]) {
         peers = newPeers.map { "\($0.id)" }
+        for p in newPeers {
+            upsertPeer(p.id) // ensure presence with default state
+        }
+        let currentSet = Set(newPeers.map { $0.id })
+        remotePeers.removeAll { !currentSet.contains($0.id) }
         appendLog("Peers: \(peers.count) connected")
     }
 
@@ -202,6 +234,42 @@ final class PeerClockViewModel {
             syncOffsetMs = 0
             syncConfidence = 1.0
             syncRoundTripMs = 0
+        }
+    }
+
+    private func handleStatus(_ snapshot: RemotePeerStatus) {
+        let keys = snapshot.entries.keys.sorted()
+        appendLog("Status from \(snapshot.peerID): gen=\(snapshot.generation), keys=\(keys.count)")
+        upsertPeer(snapshot.peerID, statusEntries: snapshot.entries)
+    }
+
+    private func handleConnection(_ event: HeartbeatMonitor.Event) {
+        appendLog("\(event.peerID): \(event.state)")
+        upsertPeer(event.peerID, connectionState: event.state)
+    }
+
+    private func upsertPeer(
+        _ id: PeerID,
+        connectionState: ConnectionState? = nil,
+        statusEntries: [String: Data]? = nil
+    ) {
+        let current = remotePeers.first { $0.id == id }
+        let cs = connectionState ?? current?.connectionState ?? .connected
+        var summary = current?.statusSummary ?? "-"
+        if let entries = statusEntries {
+            let keys = entries.keys.sorted().prefix(3)
+            summary = keys.isEmpty ? "-" : keys.joined(separator: ", ")
+        }
+        let view = RemotePeerView(
+            id: id,
+            name: "\(id)",
+            connectionState: cs,
+            statusSummary: summary
+        )
+        if let idx = remotePeers.firstIndex(where: { $0.id == id }) {
+            remotePeers[idx] = view
+        } else {
+            remotePeers.append(view)
         }
     }
 
