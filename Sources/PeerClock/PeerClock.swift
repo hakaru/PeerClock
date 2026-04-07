@@ -391,19 +391,64 @@ public final class PeerClock: @unchecked Sendable {
 
     // MARK: - EventScheduler API
 
-    /// 同期済み時刻でアクションを予約する。返されたハンドルでキャンセルと状態確認が可能。
+    /// 同期済み時刻でアクションを予約する。
+    ///
+    /// ガード順:
+    /// 1. PeerClock 未起動 → `notStarted`
+    /// 2. 未同期 or 鮮度切れ → `notSynchronized`
+    /// 3. quality < minSyncQuality → `qualityBelowThreshold`
+    /// 4. 過去時刻で遅延 > lateTolerance → `deadlineExceeded`
+    ///
     /// - parameter atSyncedTime: `clock.now` と同じ時間軸のナノ秒値
+    /// - parameter lateTolerance: 過去時刻 schedule で許容する遅延幅。デフォルト 0 (拒否)。
     public func schedule(
         atSyncedTime: UInt64,
+        lateTolerance: Duration = .zero,
         _ action: @Sendable @escaping () -> Void
-    ) async -> ScheduledEventHandle {
+    ) async throws -> ScheduledEventHandle {
+        // (0) 未起動チェック
         guard let scheduler = lock.withLock({ eventScheduler }) else {
-            // 未起動時はデッドハンドルを返す
-            let dead = EventScheduler(now: { 0 })
-            return ScheduledEventHandle(id: UUID(), scheduler: dead)
+            throw PeerClockError.notStarted
         }
+
+        // (1) 同期チェック
+        let snapshot = self.currentSync
+        guard snapshot.isSynchronized else {
+            throw PeerClockError.notSynchronized
+        }
+
+        // (2) 品質チェック
+        if let quality = snapshot.quality {
+            let confidence = quality.confidence
+            let threshold = configuration.minSyncQuality
+            if confidence < threshold {
+                throw PeerClockError.qualityBelowThreshold(quality: confidence, threshold: threshold)
+            }
+        }
+
+        // (3) 過去時刻チェック
+        let nowNs = self.now
+        if atSyncedTime < nowNs {
+            let lateNs = nowNs - atSyncedTime
+            let toleranceNs = Self.nanoseconds(from: lateTolerance)
+            if lateNs > toleranceNs {
+                throw PeerClockError.deadlineExceeded(
+                    lateBy: .nanoseconds(Int64(lateNs)),
+                    tolerance: lateTolerance
+                )
+            }
+        }
+
         let id = await scheduler.schedule(atSyncedTime: atSyncedTime, action)
         return ScheduledEventHandle(id: id, scheduler: scheduler)
+    }
+
+    /// Duration → ナノ秒変換 (内部用)
+    private static func nanoseconds(from duration: Duration) -> UInt64 {
+        let comps = duration.components
+        let secNs = UInt64(max(0, comps.seconds)) * 1_000_000_000
+        let attoNs = UInt64(max(0, comps.attoseconds / 1_000_000_000))
+        return secNs &+ attoNs
     }
 
     /// スケジューラ通知ストリーム（クロックジャンプ警告など）。
