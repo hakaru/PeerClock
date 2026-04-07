@@ -12,12 +12,21 @@ let package = Package(
         .library(
             name: "PeerClock",
             targets: ["PeerClock"]
+        ),
+        .executable(
+            name: "PeerClockCLI",
+            targets: ["PeerClockCLI"]
         )
     ],
     targets: [
         .target(
             name: "PeerClock",
             path: "Sources/PeerClock"
+        ),
+        .executableTarget(
+            name: "PeerClockCLI",
+            dependencies: ["PeerClock"],
+            path: "Sources/PeerClockCLI"
         ),
         .testTarget(
             name: "PeerClockTests",
