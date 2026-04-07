@@ -69,6 +69,7 @@ public final class PeerClock: @unchecked Sendable {
     private var syncStateForwardTask: Task<Void, Never>?
     private var heartbeatRoutingTask: Task<Void, Never>?
     private var statusPushRoutingTask: Task<Void, Never>?
+    private var heartbeatElectionTask: Task<Void, Never>?
     private var driftJumpRoutingTask: Task<Void, Never>?
 
     // MARK: - Private: Stream Continuations
@@ -185,9 +186,19 @@ public final class PeerClock: @unchecked Sendable {
                 _ = await receiver.ingestPush(from: sender, generation: generation, entries: entries)
             }
         }
+        // Phase 3a: heartbeat disconnected -> re-run election for TCP half-open cases
+        let hbElectionTask = Task { [weak self] in
+            guard let self else { return }
+            for await event in heartbeat.events {
+                if case .disconnected = event.state {
+                    await self.reevaluateCoordination()
+                }
+            }
+        }
         lock.withLock {
             self.heartbeatRoutingTask = hbRoutingTask
             self.statusPushRoutingTask = spRoutingTask
+            self.heartbeatElectionTask = hbElectionTask
         }
 
         // syncEngine のステート更新を転送するタスク
@@ -239,12 +250,13 @@ public final class PeerClock: @unchecked Sendable {
 
     /// 同期を停止する
     public func stop() async {
-        let (coordTask, syncResponder, fwdTask, hbTask, spTask, djTask, eng, tr, registry, receiver, heartbeat, sched) = lock.withLock {
+        let (coordTask, syncResponder, fwdTask, hbTask, spTask, hbElecTask, djTask, eng, tr, registry, receiver, heartbeat, sched) = lock.withLock {
             let c = coordinationTask; coordinationTask = nil
             let s = syncResponderTask; syncResponderTask = nil
             let f = syncStateForwardTask; syncStateForwardTask = nil
             let h = heartbeatRoutingTask; heartbeatRoutingTask = nil
             let sp = statusPushRoutingTask; statusPushRoutingTask = nil
+            let he = heartbeatElectionTask; heartbeatElectionTask = nil
             let dj = driftJumpRoutingTask; driftJumpRoutingTask = nil
             let e = syncEngine
             let t = transport
@@ -252,7 +264,7 @@ public final class PeerClock: @unchecked Sendable {
             let rec = statusReceiver; statusReceiver = nil
             let hb = heartbeatMonitor; heartbeatMonitor = nil
             let sc = eventScheduler; eventScheduler = nil
-            return (c, s, f, h, sp, dj, e, t, reg, rec, hb, sc)
+            return (c, s, f, h, sp, he, dj, e, t, reg, rec, hb, sc)
         }
 
         coordTask?.cancel()
@@ -260,6 +272,7 @@ public final class PeerClock: @unchecked Sendable {
         fwdTask?.cancel()
         hbTask?.cancel()
         spTask?.cancel()
+        hbElecTask?.cancel()
         djTask?.cancel()
 
         await coordTask?.value
@@ -267,6 +280,7 @@ public final class PeerClock: @unchecked Sendable {
         await fwdTask?.value
         await hbTask?.value
         await spTask?.value
+        await hbElecTask?.value
         await djTask?.value
 
         await eng?.stop()
@@ -364,15 +378,26 @@ public final class PeerClock: @unchecked Sendable {
 
             guard let elec, let eng else { continue }
 
+            let added = peers.subtracting(prevKnown)
+            let removed = prevKnown.subtracting(peers)
+
             // ピア追加/削除を heartbeatMonitor に通知
             if let hb {
-                let added = peers.subtracting(prevKnown)
-                let removed = prevKnown.subtracting(peers)
                 for p in added where p != localPeerID {
                     await hb.peerJoined(p)
                 }
                 for p in removed where p != localPeerID {
                     await hb.peerLeft(p)
+                }
+            }
+
+            // Phase 3a: flush local status once when new peers join
+            if !added.isEmpty {
+                let registry = lock.withLock { statusRegistry }
+                if let registry {
+                    let jitterNs = UInt64.random(in: 0...100_000_000)
+                    try? await Task.sleep(nanoseconds: jitterNs)
+                    await registry.flushNow()
                 }
             }
 
@@ -403,7 +428,19 @@ public final class PeerClock: @unchecked Sendable {
             peersContinuation.yield(peerList)
 
             // コーディネーター選出を更新
-            elec.updatePeers(newPeerList + [localPeerID])
+            // Phase 3a: exclude heartbeat-disconnected peers from election
+            var effectivePeers: [PeerID] = []
+            if let hb {
+                for p in newPeerList {
+                    let state = await hb.currentState(of: p)
+                    if state != ConnectionState.disconnected {
+                        effectivePeers.append(p)
+                    }
+                }
+            } else {
+                effectivePeers = newPeerList
+            }
+            elec.updatePeers(effectivePeers + [localPeerID])
             let coordinator = elec.coordinator
             let isCoord = elec.isCoordinator
 
@@ -431,6 +468,50 @@ public final class PeerClock: @unchecked Sendable {
                 await eng.stop()
                 await eng.start(coordinator: coordinator)
             }
+        }
+    }
+
+    /// Phase 3a: re-evaluate election when heartbeat reports a disconnect.
+    /// runCoordinationLoop only fires on transport.peers changes; this handles
+    /// TCP half-open cases where only the heartbeat sees the disconnect.
+    private func reevaluateCoordination() async {
+        let (peers, elec, eng, hb) = lock.withLock {
+            (knownPeers, election, syncEngine, heartbeatMonitor)
+        }
+        guard let elec, let eng else { return }
+
+        var effective: [PeerID] = []
+        if let hb {
+            for p in peers {
+                let state = await hb.currentState(of: p)
+                if state != ConnectionState.disconnected {
+                    effective.append(p)
+                }
+            }
+        } else {
+            effective = Array(peers)
+        }
+
+        let prevCoordinator = lock.withLock { currentCoordinator }
+        elec.updatePeers(effective + [localPeerID])
+        let newCoordinator = elec.coordinator
+        guard newCoordinator != prevCoordinator else { return }
+
+        lock.withLock { currentCoordinator = newCoordinator }
+
+        if elec.isCoordinator {
+            await eng.stop()
+            guard let transport = lock.withLock({ transport }) else { return }
+            startSyncResponder(transport: transport)
+        } else if let newCoordinator {
+            lock.withLock { () -> Task<Void, Never>? in
+                let t = syncResponderTask
+                syncResponderTask = nil
+                return t
+            }?.cancel()
+
+            await eng.stop()
+            await eng.start(coordinator: newCoordinator)
         }
     }
 

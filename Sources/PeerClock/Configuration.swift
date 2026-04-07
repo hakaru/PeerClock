@@ -14,6 +14,14 @@ public struct Configuration: Sendable {
     /// After this many seconds with no heartbeat, a peer is marked `.disconnected`.
     public let disconnectedAfter: TimeInterval
 
+    // MARK: - Reconnect
+
+    /// Transport 層の再接続リトライ間隔。
+    public let reconnectRetryInterval: TimeInterval
+
+    /// Transport 層の再接続リトライ最大回数。
+    public let reconnectMaxAttempts: Int
+
     // MARK: - Status debounce
 
     /// Send-side debounce window. `setStatus` calls within this window are
@@ -47,6 +55,8 @@ public struct Configuration: Sendable {
         heartbeatInterval: TimeInterval = 1.0,
         degradedAfter: TimeInterval = 2.0,
         disconnectedAfter: TimeInterval = 5.0,
+        reconnectRetryInterval: TimeInterval = 0.5,
+        reconnectMaxAttempts: Int = 3,
         statusSendDebounce: TimeInterval = 0.1,
         statusReceiveDebounce: TimeInterval = 0.05,
         syncInterval: TimeInterval = 5.0,
@@ -58,6 +68,8 @@ public struct Configuration: Sendable {
         self.heartbeatInterval = heartbeatInterval
         self.degradedAfter = degradedAfter
         self.disconnectedAfter = disconnectedAfter
+        self.reconnectRetryInterval = reconnectRetryInterval
+        self.reconnectMaxAttempts = reconnectMaxAttempts
         self.statusSendDebounce = statusSendDebounce
         self.statusReceiveDebounce = statusReceiveDebounce
         self.syncInterval = syncInterval

@@ -3,8 +3,20 @@ import Foundation
 public actor MockNetwork {
 
     private var transports: [PeerID: MockTransport] = [:]
+    private var disconnected: Set<PeerID> = []
 
     public init() {}
+
+    public func simulateDisconnect(peer: PeerID) async {
+        guard transports[peer] != nil else { return }
+        disconnected.insert(peer)
+        await publishPeerSnapshots()
+    }
+
+    public func simulateReconnect(peer: PeerID) async {
+        disconnected.remove(peer)
+        await publishPeerSnapshots()
+    }
 
     public func createTransport(
         for peerID: PeerID,
@@ -36,6 +48,7 @@ public actor MockNetwork {
         latency: Duration,
         packetDropProbability: Double
     ) async {
+        guard !disconnected.contains(sender), !disconnected.contains(receiver) else { return }
         guard Double.random(in: 0...1) >= packetDropProbability else {
             return
         }
@@ -55,27 +68,24 @@ public actor MockNetwork {
         latency: Duration,
         packetDropProbability: Double
     ) async {
-        let receivers = transports
-            .filter { $0.key != sender }
-            .map(\.value)
+        guard !disconnected.contains(sender) else { return }
+        let receivers = transports.filter { $0.key != sender && !disconnected.contains($0.key) }.map(\.value)
 
         for transport in receivers {
-            await send(
-                data,
-                from: sender,
-                to: transport.localPeerID,
-                latency: latency,
-                packetDropProbability: packetDropProbability
-            )
+            await send(data, from: sender, to: transport.localPeerID, latency: latency, packetDropProbability: packetDropProbability)
         }
     }
 
     private func publishPeerSnapshots() async {
-        let allPeerIDs = Set(transports.keys)
+        let liveIDs = Set(transports.keys).subtracting(disconnected)
         for transport in transports.values {
-            var peers = allPeerIDs
-            peers.remove(transport.localPeerID)
-            transport.updatePeers(peers)
+            if disconnected.contains(transport.localPeerID) {
+                transport.updatePeers([])
+            } else {
+                var peers = liveIDs
+                peers.remove(transport.localPeerID)
+                transport.updatePeers(peers)
+            }
         }
     }
 }

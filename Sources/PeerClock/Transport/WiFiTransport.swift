@@ -114,6 +114,10 @@ final class WiFiTransport: Transport, @unchecked Sendable {
         }
         guard shouldConnect else { return }
 
+        attemptConnect(to: endpoint, peerID: peerID, attempt: 1)
+    }
+
+    private func attemptConnect(to endpoint: NWEndpoint, peerID: PeerID, attempt: Int) {
         let connection = NWConnection(to: endpoint, using: .tcp)
         lock.withLock {
             connections[peerID] = connection
@@ -124,11 +128,28 @@ final class WiFiTransport: Transport, @unchecked Sendable {
             switch state {
             case .ready:
                 self.addPeer(peerID)
-                let handshake = localPeerID.data
+                let handshake = self.localPeerID.data
                 connection.send(content: handshake, completion: .contentProcessed { _ in })
                 self.receiveLength(from: peerID, connection: connection)
             case .failed, .cancelled:
-                self.removePeer(peerID)
+                let maxAttempts = self.configuration.reconnectMaxAttempts
+                let retryInterval = self.configuration.reconnectRetryInterval
+                if attempt < maxAttempts {
+                    self.lock.withLock {
+                        if self.connections[peerID] === connection {
+                            self.connections.removeValue(forKey: peerID)
+                        }
+                    }
+                    self.queue.asyncAfter(deadline: .now() + retryInterval) { [weak self] in
+                        guard let self else { return }
+                        let stillWanted = self.lock.withLock { self.connections[peerID] == nil }
+                        if stillWanted {
+                            self.attemptConnect(to: endpoint, peerID: peerID, attempt: attempt + 1)
+                        }
+                    }
+                } else {
+                    self.removePeer(peerID)
+                }
             default:
                 break
             }
@@ -144,9 +165,13 @@ final class WiFiTransport: Transport, @unchecked Sendable {
                 return
             }
 
-            self.lock.withLock {
+            let oldConnection = self.lock.withLock { () -> NWConnection? in
+                let old = self.connections[peerID]
                 self.connections[peerID] = connection
+                return old
             }
+            oldConnection?.cancel()
+
             self.addPeer(peerID)
             self.receiveLength(from: peerID, connection: connection)
         }
