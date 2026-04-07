@@ -35,6 +35,9 @@ public struct Configuration: Sendable {
     // MARK: - Clock sync
 
     /// Interval in seconds between sync rounds.
+    ///
+    /// - Note: Deprecated. Use ``syncBackoffStages`` instead.
+    ///   `NTPSyncEngine` no longer reads this field; it is retained for source compatibility only.
     public let syncInterval: TimeInterval
 
     /// Backoff stages (秒)。同期成功が連続するとこの順で sync interval が延長される。
