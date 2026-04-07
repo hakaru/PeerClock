@@ -702,7 +702,35 @@ public func simulateReconnect(peer: PeerID)
 
 5. **Reliable / Unreliable**: `Transport.send` / `broadcast` → `.reliable`、`broadcastUnreliable` → `.unreliable` に直接マッピング。HEARTBEAT が MPC でも unreliable で送れる。
 
-6. **切断検知**: `MCSession` が内部で接続管理・リトライを既に持っている。`.notConnected` は確定的切断とみなし、即 `peers` から削除。追加リトライはしない。Phase 3a の上位層 (runCoordinationLoop + heartbeat) と browser 継続稼働により、peer が再出現すれば自動再招待される。
+6. **切断検知**: `MCSession` が内部で接続管理・リトライを既に持っている。`.notConnected` は確定的切断とみなし、即 Transport 層の `peers` ストリームから削除する。追加リトライはしない。Phase 3a の上位層 (runCoordinationLoop + heartbeat) と browser 継続稼働により、peer が再出現すれば自動再招待される。
+   - **層の責務分離**: 「Transport の peers ストリームから削除」と「上位層の stale 状態保持 (StatusReceiver は最後の既知値を返す)」は別層の話。MultipeerTransport は peers 通知のみを担当し、stale 判定は既存の Phase 2a ロジックが担う。
+   - **送信中断**: Phase 3a と同じく、`.notConnected` 中の send / broadcast はエラーを投げ、バッファリングしない。in-flight メッセージは失われうる (Command は app の idempotency、Status は peer 復帰時の `flushNow()` で救済される)。
+
+7. **MCPeerID の永続化**: 毎回 `MCPeerID(displayName:)` を新規生成すると、周囲端末の MPC キャッシュが「同一 displayName を持つ別インスタンス」として混乱する。`UserDefaults` に `NSSecureCoding` (`MCPeerID.encode(with:)` / `init(coder:)`) で永続化し、起動時に復元する。初回のみ新規生成。PeerID (UUID) が変わる場合 (ユーザー操作でリセット等) は persisted MCPeerID も破棄して作り直す。
+
+8. **iOS バックグラウンド制限**: iOS は MPC を数秒以内にバックグラウンドで stop するため、切断は日常的なイベント。前景復帰時に Phase 3a の受動復帰フローがそのまま自然に再接続する前提。Transport.`stop()` では必ず `session.disconnect()` を明示的に呼ぶ (対向端でタイムアウトまで stale peer が残るのを避けるため)。
+
+9. **スレッドセーフティ**: `MCSessionDelegate` / `MCNearbyServiceBrowserDelegate` / `MCNearbyServiceAdvertiserDelegate` のコールバックは framework の background queue で発火する。`MultipeerTransport` 内の状態 (pcToMC / mcToPC マップ、AsyncStream 発行) はすべて `NSLock` で排他制御する。`@unchecked Sendable` なので手動同期が責務。
+
+10. **既存セッションガード (招待重複回避)**: 再招待が重なるケースに備え、`browser(:foundPeer:)` と `advertiser(:didReceiveInvitation:)` のどちらでも、対象 PeerID が既に `session.connectedPeers` または「招待中/接続中状態」にある場合は新しい招待を無視する。具体的には `pcToMC[peerID] != nil && session.connectedPeers.contains(mcPeer)` を満たせば無視。
+
+11. **8 peer 制限**: `MCSession` 仕様上、1 セッションに最大 8 peer まで。Phase 3b は **自分を含めて 8 peer** までサポートする。9 台目以降が browser で発見されても `invitePeer` を呼ばずログに警告を出して無視する。`advertiser:didReceiveInvitation:` 側も同じガード。Phase 4 の合議ベース全ペア相互測定設計にはこの上限が影響する (将来課題)。
+
+12. **必須 Delegate メソッド**:
+
+    **MCSessionDelegate**:
+    - `session(_:peer:didChange:)` — `.connected` でマップ登録+peers yield、`.notConnected` でマップ削除+peers yield、`.connecting` は無視
+    - `session(_:didReceive:fromPeer:)` — MCPeerID → PeerID 変換して `incomingMessages` に yield
+    - `session(_:didReceive:withName:fromPeer:)` / `session(_:didStartReceivingResourceWithName:fromPeer:withProgress:)` / `session(_:didFinishReceivingResourceWithName:fromPeer:at:withError:)` — 使わないが protocol 準拠のため空実装が必要
+
+    **MCNearbyServiceBrowserDelegate**:
+    - `browser(_:foundPeer:withDiscoveryInfo:)` — PeerID decode + 招待方向判定 + 8 peer ガード + 既存セッションガード + `invitePeer(:to:withContext:timeout:)`
+    - `browser(_:lostPeer:)` — 特に何もしない (session の state 変化で処理されるため)
+    - `browser(_:didNotStartBrowsingForPeers:)` — エラーログ
+
+    **MCNearbyServiceAdvertiserDelegate**:
+    - `advertiser(_:didReceiveInvitationFromPeer:withContext:invitationHandler:)` — context marker 検証 + 8 peer ガード + 既存セッションガード + `invitationHandler(true, session)` or `(false, nil)`
+    - `advertiser(_:didNotStartAdvertisingPeer:)` — エラーログ
 
 **MultipeerIdentity (純関数ヘルパ)**
 
@@ -759,7 +787,21 @@ public final class MultipeerTransport: Transport, @unchecked Sendable {
 ```swift
 /// MultipeerConnectivity service type (1-15 chars, ASCII 英数字/ハイフンのみ)
 public var mcServiceType: String = "peerclock-mpc"
+
+/// Maximum peers in a single MCSession (framework limit is 8 including self)
+public var mcMaxPeers: Int = 8
 ```
+
+**Info.plist 要求**
+
+実機で動作させるには demo app の `Info.plist` に以下を追加する必要がある:
+
+- `NSBonjourServices`: `_peerclock-mpc._tcp` と `_peerclock-mpc._udp` を追加
+- `NSLocalNetworkUsageDescription`: 既に Phase 1 で設定済みの文字列を再利用
+
+**プライバシー (既知の trade-off)**
+
+`displayName` に PeerID (UUID) を埋め込む方針は、近傍端末からデバイス識別子が直接見える。v1 (プロトタイプ) では許容範囲だが、将来的には identity hashing + 接続後ハンドシェイクで identity 交換する方式に昇華する余地あり。Phase 3b では実装しない。
 
 **Facade 統合方針**
 
