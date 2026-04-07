@@ -1,134 +1,159 @@
 # PeerClock
 
-Sub-millisecond P2P clock synchronization between iOS devices over local network.
+Peer-equal P2P clock synchronization and device coordination for Apple devices.
 
 ## What is PeerClock?
 
-PeerClock is a Swift library that synchronizes clocks across multiple iPhones and iPads on the same local network — **without an external server**. Each device agrees on "what time it is" within ~2ms, enabling coordinated actions like simultaneous recording, playback, or any event that needs to happen at the same instant on multiple devices.
+PeerClock is a Swift library that synchronizes clocks and coordinates actions across multiple Apple devices on the same local network — **without an external server, without a master device**. Every device is an equal peer. Clocks agree within ~2ms, and a generic command channel lets apps coordinate anything.
 
-## How is this different from TrueTime / Kronos?
+## How is this different?
 
-| | TrueTime / Kronos | PeerClock |
-|--|-------------------|-----------|
-| Sync target | External NTP server | Nearby iPhone/iPad (P2P) |
-| Internet | Required | Not required |
-| Use case | "Get accurate wall-clock time" | "Make 2+ devices act simultaneously" |
-| Protocol | SNTP (RFC 4330) | Custom NTP-inspired 4-timestamp exchange |
+| | TrueTime / Kronos | PeerKit / sReto | **PeerClock** |
+|--|-------------------|----------------|---------------|
+| Sync target | External NTP server | N/A | Nearby devices (P2P) |
+| Topology | Client → Server | Peer-to-peer | **Peer-equal** (auto coordinator) |
+| Internet | Required | Not required | Not required |
+| Clock sync | Yes | No | **Yes (±2ms)** |
+| Command channel | No | Data transfer only | **Generic commands** |
+| Status sharing | No | No | **Push + Pull** |
+
+No existing Swift library combines peer-equal clock sync, generic commands, and status sharing.
 
 ## Use Cases
 
 - **Multi-device audio recording** — Start recording on multiple iPhones simultaneously with sample-accurate alignment
-- **Multi-camera video capture** — Synchronize timecode across devices for post-production editing
-- **Synchronized playback** — Play audio/video in perfect sync across a room of devices
-- **Distributed timers** — Coordinated countdowns, game events, IoT sensor timestamps
-- **Any P2P app** needing devices to agree on "now"
+- **Multi-camera video capture** — Synchronize timecode across devices for post-production
+- **Synchronized playback** — Play audio/video in perfect sync across devices
+- **Device fleet management** — Monitor battery, storage, state across connected devices
+- **Any P2P app** needing devices to agree on "now" and coordinate actions
 
-## Architecture
-
-```
-┌──────────────────────────────────────────────┐
-│              PeerClock Protocol               │
-├──────────────────────────────────────────────┤
-│                                              │
-│  Layer 1: Discovery                          │
-│  └── Bonjour (NWBrowser) on local network    │
-│                                              │
-│  Layer 2: Clock Sync                         │
-│  └── UDP 4-timestamp exchange (NTP-inspired) │
-│      40 measurements → best-half filtering   │
-│      Periodic re-sync for drift correction   │
-│                                              │
-│  Layer 3: Coordinated Events                 │
-│  └── "Execute at T+offset" scheduling        │
-│      All devices fire within ±2ms            │
-│                                              │
-│  Layer 4: Fallback                           │
-│  └── MultipeerConnectivity (no Wi-Fi)        │
-│      Reduced precision (~50ms) but works     │
-│                                              │
-└──────────────────────────────────────────────┘
-```
-
-## Planned API
+## API
 
 ```swift
 import PeerClock
 
-// Master device
-let clock = PeerClock(role: .master)
-clock.start()
+// All devices run the same code — no role assignment
+let clock = PeerClock()
+try await clock.start()
 
-// Slave device
-let clock = PeerClock(role: .slave)
-clock.join(master: discoveredPeer)
-
-// Schedule synchronized event
-let fireTime = clock.now + .seconds(2)
-clock.schedule(at: fireTime) {
-    // Executes simultaneously on all devices (±2ms)
-    recorder.start()
+// Wait for peers
+for await peers in clock.peers {
+    if peers.count >= 2 { break }
 }
 
-// Read synchronized time
-let syncedTimestamp = clock.now  // Agrees across all devices
+// Synchronized time (agrees across all devices ±2ms)
+let timestamp = clock.now
+
+// Send commands (semantics defined by your app)
+try await clock.broadcast(
+    Command(type: "com.myapp.record.start", payload: config.encoded())
+)
+
+// Receive commands
+for await (sender, command) in clock.commands {
+    handleCommand(command, from: sender)
+}
 ```
 
-## Technical Details
+## Architecture
 
-### Clock Synchronization Protocol
+```
+PeerClock (Facade — all peers equal, no roles)
+│
+├── Transport          Protocol: reliable + unreliable channels
+│   ├── WiFiTransport  Network.framework (UDP + TCP)
+│   └── MockTransport  In-memory (for testing)
+│
+├── Coordination       Auto coordinator election (smallest PeerID)
+│                      Transparent to app — no API exposure
+│
+├── ClockSync          NTP-inspired 4-timestamp exchange
+│   ├── NTPSyncEngine  40 measurements, best-half filtering
+│   └── DriftMonitor   Jump detection (>10ms → full re-sync)
+│
+├── Command            Generic command send/broadcast
+│   └── CommandRouter  App defines semantics, PeerClock routes
+│
+└── Wire               Binary protocol (5-byte header + payload)
+    └── MessageCodec   Encode/decode, transport-agnostic
+```
 
-1. **Discovery** — Bonjour service advertisement on local network
-2. **Handshake** — TCP connection for reliable control messages
-3. **Clock sync** — UDP 4-timestamp exchange (NTP algorithm):
-   - Client sends t0 (departure)
-   - Server records t1 (receipt), t2 (response)
-   - Client records t3 (arrival)
-   - Offset = (t1-t0 + t2-t3) / 2
-4. **Filtering** — 40 measurements, sort by round-trip delay, use best 50%
-5. **Maintenance** — Re-sync every 5 seconds to correct crystal oscillator drift (~20-50ppm)
+### Clock Synchronization
+
+1. **Discovery** — All nodes browse + advertise via Bonjour
+2. **Coordinator election** — Smallest PeerID becomes sync reference (automatic, invisible to app)
+3. **4-timestamp exchange** — NTP-inspired: `offset = ((t1-t0) + (t2-t3)) / 2`
+4. **Best-half filtering** — 40 measurements, sort by RTT, use fastest 50%
+5. **Periodic re-sync** — Every 5 seconds to correct crystal oscillator drift (20-50ppm)
+6. **Jump detection** — Offset change >10ms triggers full re-sync
 
 ### Precision Budget
 
 | Source | Error | Mitigation |
 |--------|-------|------------|
-| Wi-Fi UDP jitter | 1-10ms | Best-half filtering reduces to ~1-2ms |
-| Crystal oscillator drift | 50ppm = 0.25ms/5s | Periodic re-sync |
-| iOS scheduling | <1ms | `mach_absolute_time` for sub-ms timing |
+| Wi-Fi UDP jitter | 1-10ms | Best-half filtering → ~1-2ms |
+| Crystal oscillator drift | 50ppm = 0.25ms/5s | 5s periodic re-sync |
+| iOS scheduling | <1ms | `mach_continuous_time` for sub-ms timing |
 | **Total** | **±2ms typical** | |
-
-### Fallback: MultipeerConnectivity
-
-When no Wi-Fi network is available, PeerClock falls back to MultipeerConnectivity (Wi-Fi Direct + Bluetooth). Precision drops to ~50ms but connectivity is maintained. Post-processing with acoustic markers can recover sub-ms precision.
 
 ## Requirements
 
-- iOS 17.0+
+- iOS 17.0+ / macOS 14+
 - Swift 6.0+
-- Same local Wi-Fi network (primary) or Bluetooth range (fallback)
+- Same local Wi-Fi network
 
 ## Installation
 
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/hakaru/PeerClock.git", from: "0.1.0")
+    .package(url: "https://github.com/hakaru/PeerClock.git", from: "0.2.0")
 ]
 ```
 
 ## Roadmap
 
-- [ ] Core NTP-inspired clock sync protocol
-- [ ] Bonjour discovery
-- [ ] Master/slave role management
-- [ ] Coordinated event scheduling
-- [ ] MultipeerConnectivity fallback
-- [ ] Acoustic sync marker support (ultrasonic pulse for sub-sample alignment)
-- [ ] Clock drift monitoring and reporting
+### Phase 1: Transport + ClockSync + Command ✅
+
+- [x] Peer-equal architecture (no master/slave)
+- [x] Transport protocol abstraction (reliable / unreliable)
+- [x] Bonjour discovery (all nodes browse + advertise)
+- [x] Coordinator auto-election (smallest PeerID)
+- [x] NTP-inspired 4-timestamp clock sync + best-half filtering
+- [x] Drift monitoring and jump detection
+- [x] Generic command channel (send / broadcast)
+- [x] Wire protocol codec (5-byte header, transport-agnostic)
+- [x] MockTransport for unit testing
+- [x] WiFiTransport (Network.framework UDP/TCP)
+- [x] PeerClock facade (role-free public API)
+
+### Phase 2: Status + Event Scheduling
+
+- [ ] Status registry (common `pc.*` + custom app-defined keys)
+- [ ] Status push (auto-broadcast on change) + pull (on-demand request)
+- [ ] Status generation counter for freshness
+- [ ] Debounce for high-frequency status updates
+- [ ] Heartbeat + connection state (connected → degraded → disconnected)
+- [ ] Event scheduler (`mach_absolute_time` precision firing)
+
+### Phase 3: Resilience
+
+- [ ] MultipeerConnectivity fallback transport (~50ms precision)
+- [ ] Automatic transport switching (Wi-Fi → MPC)
+- [ ] Reconnection logic + coordinator re-election
+- [ ] Background mode handling
+
+### Phase 4: Advanced Sync
+
+- [ ] Consensus-based sync (all-pairs measurement, median reference)
+- [ ] Network quality-based coordinator election
+- [ ] Clock quality metrics reporting
+- [ ] Acoustic sync markers (ultrasonic pulse + cross-correlation)
 - [ ] watchOS support
 
 ## Background
 
-PeerClock was born from [1Take](https://github.com/hakaru/1Take), an iOS audio recording app. The need to synchronize multiple iPhones for multi-device recording led to the realization that P2P clock synchronization is a general-purpose problem with no existing Swift solution.
+PeerClock was born from [1Take](https://github.com/hakaru/1Take), an iOS multi-device audio recording app. The need to synchronize multiple iPhones led to the realization that P2P device coordination is a general-purpose problem with no existing Swift solution — especially not with peer-equal topology.
 
 ## License
 
