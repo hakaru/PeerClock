@@ -472,8 +472,82 @@ connected ──(1回ミス)──→ degraded ──(閾値超え)──→ dis
 
 ### Phase 2b: イベントスケジューリング
 
-- `EventScheduler`: 同期済み時刻での精密発火（mach_continuous_time ベース）
-- API 形（facade 直下 vs 独立型）は 2a 実装完了後に確定
+#### スコープ
+- `EventScheduler` actor + facade 直下の `schedule` API
+- `ScheduledEventHandle`（cancel + state 問い合わせ）
+- ジャンプ通知用の `schedulerEvents: AsyncStream<SchedulerEvent>`
+
+#### 含まないもの (YAGNI)
+- 繰り返し実行（v1 では単発のみ）
+- `SyncedInstant` 型ラッパ（命名と doc で防御、必要なら overload 追加可）
+- sub-ms 精度（mach_wait_until 二段階化は将来最適化）
+- AVAudioSession / Background Tasks 統合
+- ドリフト中の動的再照準（決定論的優先、ジャンプ時は警告のみ）
+
+#### 公開 API
+
+```swift
+extension PeerClock {
+    /// 同期済み時刻で action を発火する。
+    /// - parameter atSyncedTime: clock.now と同じ time base (mach_continuous_time + sync offset, ナノ秒)
+    /// - 過去時刻は即発火 (state == .missed)
+    /// - stop() 時には保留中イベントは全て .cancelled になる
+    /// - precision target: ±5ms (1Take の同時録音想定で吸収可能なレンジ)
+    /// - フォアグラウンド前提。バックグラウンドでの精度は保証しない
+    public func schedule(
+        atSyncedTime: UInt64,
+        _ action: @Sendable @escaping () -> Void
+    ) async -> ScheduledEventHandle
+
+    /// クロックジャンプ等の警告イベントを流すストリーム
+    public var schedulerEvents: AsyncStream<SchedulerEvent> { get }
+}
+
+public struct ScheduledEventHandle: Sendable, Hashable {
+    public let id: UUID
+    public func cancel() async
+    public func state() async -> ScheduledEventState
+}
+
+public enum ScheduledEventState: Sendable {
+    case pending     // 待機中
+    case fired       // 発火済み
+    case cancelled   // キャンセル済み
+    case missed      // 過去時刻指定で即発火扱い
+}
+
+public enum SchedulerEvent: Sendable {
+    /// クロックジャンプ検知。eventID が予約中で、新オフセットで発火時刻が
+    /// 当初予定より大きくずれる可能性がある (再照準はしない)
+    case driftWarning(eventID: UUID, oldOffsetNs: Int64, newOffsetNs: Int64)
+}
+```
+
+#### 内部設計
+- `EventScheduler` は **actor**。`[UUID: ScheduledEvent]` でイベントを管理
+- **1 イベント = 1 Task**: `Task { try? await Task.sleep(nanoseconds: delay); detached fire }` の構造
+- **action は detached Task で実行**: scheduler actor をブロックしない。アプリは action 内で `Task { @MainActor in ... }` と書けば UI 更新可
+- **時刻計算**: `delay = Int64(atSyncedTime) - Int64(clock.now)`、負なら即発火・state を `.missed`
+- **ジャンプ通知**: `DriftMonitor` の jump イベントを購読、保留中イベントに対して `schedulerEvents` に `.driftWarning` を yield + `os_log` に warning ログを出力（再照準はしない）
+- **stop**: 全 Task キャンセル、全ハンドル state を `.cancelled` に、`schedulerEvents` continuation finish
+
+#### 待機実装
+- `Task.sleep(nanoseconds:)` ベース。Swift 6 のキャンセル統合と相性が良い
+- 将来精度要求が上がれば「coarse sleep + 短い mach_wait_until」の二段階化に差し替え可能
+
+#### Wire Protocol
+- 追加なし。EventScheduler はローカル動作のみ。同期時刻の peer 間共有が必要な場合はアプリが既存の `Command` チャネルで時刻値を送る
+
+#### テスト戦略
+- **ユニット (仮想時計)**: `now: () -> UInt64` を注入する HeartbeatMonitor 方式
+  - 順序: 複数イベントが指定時刻順に発火
+  - cancel: 待機中ハンドルを cancel すると action が呼ばれない
+  - state 遷移: pending → fired / cancelled / missed
+  - 期限切れ: 過去時刻指定で即発火、state == .missed
+  - ジャンプ通知: DriftMonitor のジャンプを擬似注入 → schedulerEvents に `.driftWarning` が届く
+  - stop: 保留イベント全て cancelled
+- **統合 (MockNetwork)**: 2台が同じ synced time に schedule → 両端でほぼ同時に action 実行
+- **実機**: Demo app に「3秒後にビープ」ボタンを追加し、両端の発火タイミングを目視/ログで確認
 
 ### Phase 3: レジリエンス
 
