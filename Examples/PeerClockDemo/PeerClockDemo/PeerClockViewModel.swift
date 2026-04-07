@@ -52,6 +52,7 @@ final class PeerClockViewModel {
     private(set) var remotePeers: [RemotePeerView] = []
     private(set) var logs: [LogEntry] = []
     private(set) var commandLog: [CommandLogEntry] = []
+    var useMultipeerConnectivity: Bool = false
 
     // MARK: - Private
 
@@ -70,7 +71,16 @@ final class PeerClockViewModel {
         guard case .stopped = runState else { return }
         runState = .starting
 
-        let clock = PeerClock()
+        let clock: PeerClock
+        if useMultipeerConnectivity {
+            clock = PeerClock(transportFactory: { peerID in
+                MultipeerTransport(localPeerID: peerID, configuration: .default)
+            })
+            appendLog("Using MultipeerTransport (MC)")
+        } else {
+            clock = PeerClock()
+            appendLog("Using WiFiTransport (default)")
+        }
         self.clock = clock
         self.localPeerID = "\(clock.localPeerID)"
         appendLog("Starting PeerClock (peer: \(localPeerID))")
@@ -146,6 +156,11 @@ final class PeerClockViewModel {
         runState = .stopped
         remotePeers = []
         appendLog("Stopped.")
+    }
+
+    var isStopped: Bool {
+        if case .stopped = runState { return true }
+        return false
     }
 
     // MARK: - Broadcast
