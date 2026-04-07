@@ -119,6 +119,8 @@ public final class PeerClock: @unchecked Sendable {
             return newTransport
         }
 
+        try tr.start()
+
         syncStateContinuation.yield(.discovering)
 
         // syncEngine のステート更新を転送するタスク
@@ -145,7 +147,7 @@ public final class PeerClock: @unchecked Sendable {
 
     /// 同期を停止する
     public func stop() async {
-        let (coordTask, syncResponder, fwdTask, eng) = lock.withLock {
+        let (coordTask, syncResponder, fwdTask, eng, tr) = lock.withLock {
             let c = coordinationTask
             coordinationTask = nil
             let s = syncResponderTask
@@ -153,7 +155,8 @@ public final class PeerClock: @unchecked Sendable {
             let f = syncStateForwardTask
             syncStateForwardTask = nil
             let e = syncEngine
-            return (c, s, f, e)
+            let t = transport
+            return (c, s, f, e, t)
         }
 
         coordTask?.cancel()
@@ -165,6 +168,7 @@ public final class PeerClock: @unchecked Sendable {
         await fwdTask?.value
 
         await eng?.stop()
+        tr?.stop()
 
         syncStateContinuation.yield(.idle)
     }

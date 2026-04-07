@@ -180,9 +180,11 @@ final class WiFiTransport: Transport, @unchecked Sendable {
             udpConnections[peerID] = udpConnection
         }
 
+        FileHandle.standardError.write(Data("[WiFiTransport] connectToPeer \(peerID) endpoint=\(endpoint)\n".utf8))
         // TCP状態ハンドラ
         tcpConnection.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
+            FileHandle.standardError.write(Data("[WiFiTransport] tcp \(peerID) state: \(state)\n".utf8))
             switch state {
             case .ready:
                 _ = self.lock.withLock { self._connectedPeers.insert(peerID) }

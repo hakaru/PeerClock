@@ -4,6 +4,7 @@ import PeerClock
 @main
 struct PeerClockCLI {
     static func main() async {
+        setbuf(stdout, nil)
         let clock = PeerClock()
 
         log("Local peer: \(clock.localPeerID)")
@@ -19,7 +20,7 @@ struct PeerClockCLI {
         log("Discovering peers on local network (_peerclock._tcp)...")
 
         // Monitor sync state
-        Task {
+        Task.detached {
             for await state in clock.syncState {
                 switch state {
                 case .idle:
@@ -42,7 +43,7 @@ struct PeerClockCLI {
         }
 
         // Monitor peers
-        Task {
+        Task.detached {
             for await peers in clock.peers {
                 let names = peers.map { "\($0.id)" }.joined(separator: ", ")
                 log("Peers (\(peers.count)): [\(names)]")
@@ -50,7 +51,7 @@ struct PeerClockCLI {
         }
 
         // Monitor incoming commands
-        Task {
+        Task.detached {
             for await (sender, command) in clock.commands {
                 let payloadStr = String(data: command.payload, encoding: .utf8) ?? "<binary>"
                 log("Received: \(command.type) \"\(payloadStr)\" from \(sender)")

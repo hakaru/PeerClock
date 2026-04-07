@@ -8,6 +8,8 @@ public enum ConnectionEvent: Sendable {
 }
 
 public protocol Transport: Sendable {
+    func start() throws
+    func stop()
     func sendUnreliable(_ data: Data, to peer: PeerID) async throws
     var unreliableMessages: AsyncStream<(PeerID, Data)> { get }
     func sendReliable(_ data: Data, to peer: PeerID) async throws

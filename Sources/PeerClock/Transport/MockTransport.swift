@@ -134,6 +134,11 @@ public final class MockTransport: Transport, @unchecked Sendable {
         _network = network
     }
 
+    // MARK: Transport lifecycle
+
+    public func start() throws {}
+    public func stop() {}
+
     // MARK: Internal
 
     /// 受信メッセージを適切なストリームに流す。
