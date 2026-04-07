@@ -44,6 +44,45 @@ public final class PeerClock: @unchecked Sendable {
         lock.withLock { currentCoordinator }
     }
 
+    /// 現在の同期状態のアトミックスナップショット。
+    /// schedule のガードや UI 表示で使用する。
+    public var currentSync: SyncSnapshot {
+        let captured = NTPSyncEngine.now()
+        return lock.withLock {
+            // コーディネーター自身は時刻基準なので常に synced 扱い
+            // (eng.start() が呼ばれないため lastSyncState は .idle のままになる)
+            let isCoordinatorSelf = (self.currentCoordinator == self.localPeerID)
+            if isCoordinatorSelf {
+                let selfQuality = SyncQuality(offsetNs: 0, roundTripDelayNs: 0, confidence: 1.0)
+                return SyncSnapshot(
+                    state: .synced(offset: 0.0, quality: selfQuality),
+                    offset: 0.0,
+                    quality: selfQuality,
+                    lastSyncedAt: captured,
+                    capturedAt: captured,
+                    staleAfterNs: self.configuration.syncStaleAfterNs
+                )
+            }
+
+            let q: SyncQuality? = {
+                if case .synced(_, let quality) = self.lastSyncState { return quality }
+                return nil
+            }()
+            let off: TimeInterval = {
+                if case .synced(let offset, _) = self.lastSyncState { return offset }
+                return 0.0
+            }()
+            return SyncSnapshot(
+                state: self.lastSyncState,
+                offset: off,
+                quality: q,
+                lastSyncedAt: self.lastSyncedAtNs,
+                capturedAt: captured,
+                staleAfterNs: self.configuration.syncStaleAfterNs
+            )
+        }
+    }
+
     /// FailoverTransport 使用時のみ非 nil。現在 active な Transport の label を返す。
     public var activeTransportLabel: String? {
         let current = lock.withLock { transport }
@@ -63,6 +102,13 @@ public final class PeerClock: @unchecked Sendable {
     private var syncEngine: NTPSyncEngine?
     private var driftMonitor: DriftMonitor?
     private var commandRouter: CommandRouter?
+
+    // MARK: - Private: Sync State Cache
+
+    /// lock 配下に保持される直近の同期状態 (currentSync の元データ)
+    private var lastSyncState: SyncState = .idle
+    /// lock 配下に保持される直近の .synced 遷移時刻 (CLOCK_MONOTONIC ns)
+    private var lastSyncedAtNs: UInt64? = nil
     private var statusRegistry: StatusRegistry?
     private var statusReceiver: StatusReceiver?
     private var heartbeatMonitor: HeartbeatMonitor?
@@ -224,9 +270,16 @@ public final class PeerClock: @unchecked Sendable {
         }
         lock.withLock { self.driftJumpRoutingTask = driftJumpTask }
         let cont = syncStateContinuation
-        let forwardTask = Task {
+        let selfLock = self.lock
+        let forwardTask = Task { [weak self] in
             for await state in eng.syncStateUpdates {
                 cont.yield(state)
+                selfLock.withLock {
+                    self?.lastSyncState = state
+                    if case .synced = state {
+                        self?.lastSyncedAtNs = NTPSyncEngine.now()
+                    }
+                }
                 if case .synced(let offset, let quality) = state {
                     dm.recordOffset(offset * 1_000_000_000)
                     let offsetNs = Int64(offset * 1_000_000_000)
@@ -297,6 +350,10 @@ public final class PeerClock: @unchecked Sendable {
         await sched?.shutdown()
         await tr?.stop()
 
+        lock.withLock {
+            self.lastSyncState = .idle
+            self.lastSyncedAtNs = nil
+        }
         syncStateContinuation.yield(.idle)
     }
 
@@ -350,19 +407,64 @@ public final class PeerClock: @unchecked Sendable {
 
     // MARK: - EventScheduler API
 
-    /// 同期済み時刻でアクションを予約する。返されたハンドルでキャンセルと状態確認が可能。
+    /// 同期済み時刻でアクションを予約する。
+    ///
+    /// ガード順:
+    /// 1. PeerClock 未起動 → `notStarted`
+    /// 2. 未同期 or 鮮度切れ → `notSynchronized`
+    /// 3. quality < minSyncQuality → `qualityBelowThreshold`
+    /// 4. 過去時刻で遅延 > lateTolerance → `deadlineExceeded`
+    ///
     /// - parameter atSyncedTime: `clock.now` と同じ時間軸のナノ秒値
+    /// - parameter lateTolerance: 過去時刻 schedule で許容する遅延幅。デフォルト 0 (拒否)。
     public func schedule(
         atSyncedTime: UInt64,
+        lateTolerance: Duration = .zero,
         _ action: @Sendable @escaping () -> Void
-    ) async -> ScheduledEventHandle {
+    ) async throws -> ScheduledEventHandle {
+        // (0) 未起動チェック
         guard let scheduler = lock.withLock({ eventScheduler }) else {
-            // 未起動時はデッドハンドルを返す
-            let dead = EventScheduler(now: { 0 })
-            return ScheduledEventHandle(id: UUID(), scheduler: dead)
+            throw PeerClockError.notStarted
         }
+
+        // (1) 同期チェック
+        let snapshot = self.currentSync
+        guard snapshot.isSynchronized else {
+            throw PeerClockError.notSynchronized
+        }
+
+        // (2) 品質チェック
+        if let quality = snapshot.quality {
+            let confidence = quality.confidence
+            let threshold = configuration.minSyncQuality
+            if confidence < threshold {
+                throw PeerClockError.qualityBelowThreshold(quality: confidence, threshold: threshold)
+            }
+        }
+
+        // (3) 過去時刻チェック
+        let nowNs = self.now
+        if atSyncedTime < nowNs {
+            let lateNs = nowNs - atSyncedTime
+            let toleranceNs = Self.nanoseconds(from: lateTolerance)
+            if lateNs > toleranceNs {
+                throw PeerClockError.deadlineExceeded(
+                    lateBy: .nanoseconds(Int64(lateNs)),
+                    tolerance: lateTolerance
+                )
+            }
+        }
+
         let id = await scheduler.schedule(atSyncedTime: atSyncedTime, action)
         return ScheduledEventHandle(id: id, scheduler: scheduler)
+    }
+
+    /// Duration → ナノ秒変換 (内部用)
+    private static func nanoseconds(from duration: Duration) -> UInt64 {
+        let comps = duration.components
+        let secNs = UInt64(max(0, comps.seconds)) * 1_000_000_000
+        let attoNs = UInt64(max(0, comps.attoseconds / 1_000_000_000))
+        return secNs &+ attoNs
     }
 
     /// スケジューラ通知ストリーム（クロックジャンプ警告など）。

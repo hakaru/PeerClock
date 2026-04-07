@@ -72,7 +72,7 @@ public actor EventScheduler {
         let waitNs = UInt64(delay)
         let task = Task {
             try? await self.sleeper.sleep(nanoseconds: waitNs)
-            await self.tryFire(id, forceMissed: false)
+            self.tryFire(id, forceMissed: false)
         }
         event.task = task
         events[id] = event
@@ -91,16 +91,43 @@ public actor EventScheduler {
     }
 
     /// Forwarded by PeerClock when DriftMonitor reports a jump.
+    /// 全 pending event について古い Sleeper Task を cancel し、
+    /// 新しい now() で delay を再計算して再スケジュールする。
+    /// jump で過去化した event は即時 fire (forceMissed) される。
     public func handleJump(oldOffsetNs: Int64, newOffsetNs: Int64) {
-        for (id, event) in events where event.state == .pending {
+        // snapshot を先に取得してから反復する（反復中に events を変更しないため）
+        let pending = events.filter { $0.value.state == .pending }
+
+        for (id, event) in pending {
             logger.warning(
-                "Drift jump during scheduled event \(id.uuidString): old=\(oldOffsetNs) new=\(newOffsetNs)"
+                "Drift jump rescheduling event \(id.uuidString): old=\(oldOffsetNs) new=\(newOffsetNs)"
             )
             eventContinuation.yield(.driftWarning(
                 eventID: id,
                 oldOffsetNs: oldOffsetNs,
                 newOffsetNs: newOffsetNs
             ))
+
+            // 1. 古い Sleeper Task を cancel（state は .pending のまま保持）
+            event.task?.cancel()
+            var updated = event
+            updated.task = nil
+            events[id] = updated
+
+            // 2. 新しい now() で delay を再計算
+            let delay = Int64(updated.atSyncedTime) - Int64(now())
+            if delay <= 0 {
+                // jump で過去化した event は即時 missed fire
+                tryFire(id, forceMissed: true)
+            } else {
+                let waitNs = UInt64(delay)
+                let task = Task {
+                    try? await self.sleeper.sleep(nanoseconds: waitNs)
+                    self.tryFire(id, forceMissed: false)
+                }
+                updated.task = task
+                events[id] = updated
+            }
         }
     }
 

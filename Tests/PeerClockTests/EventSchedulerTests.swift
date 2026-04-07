@@ -197,4 +197,133 @@ struct EventSchedulerTests {
         #expect(await scheduler.state(of: id1) == .cancelled)
         #expect(await scheduler.state(of: id2) == .cancelled)
     }
+
+    // MARK: - handleJump rescheduling tests
+
+    @Test("handleJump: 未来 event を新時間軸で再スケジュール")
+    func handleJumpReschedulesToNewTimeline() async throws {
+        let clock = VClock()
+        let sleeper = MockSleeper()
+        let scheduler = EventScheduler(now: { clock.read() }, sleeper: sleeper)
+        let counter = Counter()
+
+        // now=0, target=1_000_000_000 でスケジュール（1s 先）
+        let id = await scheduler.schedule(atSyncedTime: 1_000_000_000) {
+            Task { await counter.increment() }
+        }
+        // Sleeper が sleep enqueue されるのを待つ
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        // now を 500_000_000 に進める（clock のみ進め、sleeper は進めない）
+        clock.advance(500_000_000)
+
+        // jump 発生 → 古い Task cancel → 新 delay = 1_000_000_000 - 500_000_000 = 500_000_000 で再スケジュール
+        await scheduler.handleJump(oldOffsetNs: 0, newOffsetNs: 5_000_000)
+
+        // 新しい sleeper waiter が enqueue されるのを待つ
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        // 新 delay 分 sleeper を進める
+        clock.advance(500_000_000)
+        await sleeper.advance(by: 500_000_000)
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        #expect(await counter.read() == 1)
+        #expect(await scheduler.state(of: id) == .fired)
+    }
+
+    @Test("handleJump: 過去化した event は即時 fire (missed)")
+    func handleJumpFiresPastEventImmediately() async throws {
+        let clock = VClock()
+        let sleeper = MockSleeper()
+        let scheduler = EventScheduler(now: { clock.read() }, sleeper: sleeper)
+        let counter = Counter()
+
+        // target=1_000_000_000 でスケジュール
+        let id = await scheduler.schedule(atSyncedTime: 1_000_000_000) {
+            Task { await counter.increment() }
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        // now を target を超えた時刻まで進める（jump で過去化）
+        clock.advance(2_000_000_000)
+
+        // handleJump → delay <= 0 → tryFire(forceMissed: true) が即座に呼ばれる
+        await scheduler.handleJump(oldOffsetNs: 0, newOffsetNs: 1_000_000_000)
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        #expect(await counter.read() == 1)
+        #expect(await scheduler.state(of: id) == .missed)
+    }
+
+    @Test("handleJump: 複数 pending を全件再照準")
+    func handleJumpReschedulesAllPending() async throws {
+        let clock = VClock()
+        let sleeper = MockSleeper()
+        let scheduler = EventScheduler(now: { clock.read() }, sleeper: sleeper)
+        let counter = Counter()
+
+        // now=0 で 3 件スケジュール
+        let id1 = await scheduler.schedule(atSyncedTime: 1_000_000_000) {
+            Task { await counter.increment() }
+        }
+        let id2 = await scheduler.schedule(atSyncedTime: 2_000_000_000) {
+            Task { await counter.increment() }
+        }
+        let id3 = await scheduler.schedule(atSyncedTime: 3_000_000_000) {
+            Task { await counter.increment() }
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        // now を 500_000_000 に進める
+        clock.advance(500_000_000)
+
+        // handleJump: 古い 3 Task cancel → 各々 delay = target - 500_000_000 で再スケジュール
+        await scheduler.handleJump(oldOffsetNs: 0, newOffsetNs: 5_000_000)
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        // 3 件すべての新 deadline を超える分だけ進める（最大 = 3_000_000_000 - 500_000_000 = 2_500_000_000）
+        clock.advance(2_500_000_000)
+        await sleeper.advance(by: 2_500_000_000)
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        #expect(await counter.read() == 3)
+        #expect(await scheduler.state(of: id1) == .fired)
+        #expect(await scheduler.state(of: id2) == .fired)
+        #expect(await scheduler.state(of: id3) == .fired)
+    }
+
+    @Test("handleJump: 二重実行されない")
+    func handleJumpNoDoubleFire() async throws {
+        let clock = VClock()
+        let sleeper = MockSleeper()
+        let scheduler = EventScheduler(now: { clock.read() }, sleeper: sleeper)
+        let counter = Counter()
+
+        // target=1_000_000_000 で 1 件スケジュール
+        let id = await scheduler.schedule(atSyncedTime: 1_000_000_000) {
+            Task { await counter.increment() }
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        clock.advance(100_000_000)
+
+        // handleJump を 2 回連続で呼ぶ（各回で delay > 0 → 再スケジュール）
+        await scheduler.handleJump(oldOffsetNs: 0, newOffsetNs: 5_000_000)
+        try await Task.sleep(nanoseconds: 30_000_000)
+        await scheduler.handleJump(oldOffsetNs: 5_000_000, newOffsetNs: 10_000_000)
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        // 最終 delay 分を超えて進める
+        clock.advance(2_000_000_000)
+        await sleeper.advance(by: 2_000_000_000)
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        // tryFire の state guard により 1 回しか実行されない
+        #expect(await counter.read() == 1)
+        #expect(await scheduler.state(of: id) == .fired)
+    }
 }
