@@ -1,57 +1,25 @@
-// PeerClock.swift
-// Sub-millisecond P2P clock synchronization between iOS devices
-
 import Foundation
 
-/// P2P clock synchronization for iOS devices on a local network.
+/// P2P clock synchronization for Apple devices on a local network.
 ///
 /// PeerClock enables multiple devices to agree on a shared time reference
 /// within ±2ms, without requiring an external server or internet connection.
+/// All peers are equal — there is no master/slave distinction.
 ///
 /// ```swift
-/// // Master device
-/// let clock = PeerClock(role: .master)
+/// let clock = PeerClock()
 /// clock.start()
 ///
-/// // Slave device
-/// let clock = PeerClock(role: .slave)
-/// clock.join(master: discoveredPeer)
-///
-/// // Synchronized time
 /// let now = clock.now  // Agrees across all devices (±2ms)
 /// ```
 public final class PeerClock: Sendable {
 
-    /// The role of this device in the sync network.
-    public enum Role: Sendable {
-        /// Time reference source. Other devices synchronize to this clock.
-        case master
-        /// Synchronizes its clock to the master device.
-        case slave
-    }
-
-    /// Current synchronization state.
-    public enum State: Sendable {
-        /// Not started.
-        case idle
-        /// Discovering peers / advertising.
-        case discovering
-        /// Clock sync in progress.
-        case syncing
-        /// Synchronized and ready.
-        case synced(offset: TimeInterval)
-        /// Connection lost, attempting recovery.
-        case reconnecting
-        /// Unrecoverable error.
-        case error(String)
-    }
-
     /// Library version.
-    public static let version = "0.1.0"
+    public static let version = "0.2.0"
 
-    /// Initialize PeerClock with a role.
-    /// - Parameter role: `.master` or `.slave`
-    public init(role: Role) {
-        // TODO: Phase 1 implementation
+    /// Initialize PeerClock with an optional configuration.
+    /// - Parameter configuration: Runtime settings. Defaults to `Configuration.default`.
+    public init(configuration: Configuration = .default) {
+        // TODO: Phase 2 implementation
     }
 }
