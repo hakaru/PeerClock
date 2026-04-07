@@ -49,6 +49,21 @@ public final class PeerClock: @unchecked Sendable {
     public var currentSync: SyncSnapshot {
         let captured = NTPSyncEngine.now()
         return lock.withLock {
+            // コーディネーター自身は時刻基準なので常に synced 扱い
+            // (eng.start() が呼ばれないため lastSyncState は .idle のままになる)
+            let isCoordinatorSelf = (self.currentCoordinator == self.localPeerID)
+            if isCoordinatorSelf {
+                let selfQuality = SyncQuality(offsetNs: 0, roundTripDelayNs: 0, confidence: 1.0)
+                return SyncSnapshot(
+                    state: .synced(offset: 0.0, quality: selfQuality),
+                    offset: 0.0,
+                    quality: selfQuality,
+                    lastSyncedAt: captured,
+                    capturedAt: captured,
+                    staleAfterNs: self.configuration.syncStaleAfterNs
+                )
+            }
+
             let q: SyncQuality? = {
                 if case .synced(_, let quality) = self.lastSyncState { return quality }
                 return nil
@@ -255,10 +270,11 @@ public final class PeerClock: @unchecked Sendable {
         }
         lock.withLock { self.driftJumpRoutingTask = driftJumpTask }
         let cont = syncStateContinuation
+        let selfLock = self.lock
         let forwardTask = Task { [weak self] in
             for await state in eng.syncStateUpdates {
                 cont.yield(state)
-                self?.lock.withLock {
+                selfLock.withLock {
                     self?.lastSyncState = state
                     if case .synced = state {
                         self?.lastSyncedAtNs = NTPSyncEngine.now()

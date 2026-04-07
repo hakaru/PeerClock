@@ -72,7 +72,7 @@ public actor EventScheduler {
         let waitNs = UInt64(delay)
         let task = Task {
             try? await self.sleeper.sleep(nanoseconds: waitNs)
-            await self.tryFire(id, forceMissed: false)
+            self.tryFire(id, forceMissed: false)
         }
         event.task = task
         events[id] = event
@@ -123,7 +123,7 @@ public actor EventScheduler {
                 let waitNs = UInt64(delay)
                 let task = Task {
                     try? await self.sleeper.sleep(nanoseconds: waitNs)
-                    await self.tryFire(id, forceMissed: false)
+                    self.tryFire(id, forceMissed: false)
                 }
                 updated.task = task
                 events[id] = updated

@@ -14,17 +14,45 @@ struct EventSchedulerIntegrationTests {
         func readAt() -> UInt64 { firedAt }
     }
 
+    /// Poll for isSynchronized with a deadline (retries every 50ms up to maxMs).
+    private static func waitForSync(_ clock: PeerClock, maxMs: Int = 3000) async {
+        let deadline = Date().addingTimeInterval(Double(maxMs) / 1000.0)
+        while Date() < deadline {
+            if clock.currentSync.isSynchronized { return }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+
+    private static func fastSyncConfig() -> Configuration {
+        Configuration(
+            heartbeatInterval: 0.1,
+            degradedAfter: 0.5,
+            disconnectedAfter: 1.0,
+            syncBackoffStages: [0.1],
+            syncBackoffPromoteAfter: 1,
+            syncMeasurements: 2,
+            syncMeasurementInterval: 0.005
+        )
+    }
+
     @Test("schedule via facade fires after real wait")
     func facadeFires() async throws {
         let network = MockNetwork()
-        let clock = PeerClock(transportFactory: { id in
+        let config = Self.fastSyncConfig()
+        let clockA = PeerClock(configuration: config, transportFactory: { id in
             MockTransport(localPeerID: id, network: network)
         })
-        try await clock.start()
+        let clockB = PeerClock(configuration: config, transportFactory: { id in
+            MockTransport(localPeerID: id, network: network)
+        })
+        try await clockA.start()
+        try await clockB.start()
+        // 同期完了を待つ
+        await Self.waitForSync(clockA); await Self.waitForSync(clockB)
 
         let box = Box()
-        let when = clock.now + 80_000_000 // 80ms 後
-        let handle = try await clock.schedule(atSyncedTime: when) {
+        let when = clockA.now + 80_000_000 // 80ms 後
+        let handle = try await clockA.schedule(atSyncedTime: when) {
             let t = NTPSyncEngine.now()
             Task { await box.mark(t) }
         }
@@ -34,20 +62,27 @@ struct EventSchedulerIntegrationTests {
         let s = await handle.state()
         #expect(s == .fired || s == .missed)
 
-        await clock.stop()
+        await clockA.stop()
+        await clockB.stop()
     }
 
     @Test("schedule cancel via handle prevents fire")
     func cancelViaHandle() async throws {
         let network = MockNetwork()
-        let clock = PeerClock(transportFactory: { id in
+        let config = Self.fastSyncConfig()
+        let clockA = PeerClock(configuration: config, transportFactory: { id in
             MockTransport(localPeerID: id, network: network)
         })
-        try await clock.start()
+        let clockB = PeerClock(configuration: config, transportFactory: { id in
+            MockTransport(localPeerID: id, network: network)
+        })
+        try await clockA.start()
+        try await clockB.start()
+        await Self.waitForSync(clockA); await Self.waitForSync(clockB)
 
         let box = Box()
-        let when = clock.now + 200_000_000 // 200ms 後
-        let handle = try await clock.schedule(atSyncedTime: when) {
+        let when = clockA.now + 200_000_000 // 200ms 後
+        let handle = try await clockA.schedule(atSyncedTime: when) {
             let t = NTPSyncEngine.now()
             Task { await box.mark(t) }
         }
@@ -59,23 +94,25 @@ struct EventSchedulerIntegrationTests {
         #expect(await box.read() == false)
         #expect(await handle.state() == .cancelled)
 
-        await clock.stop()
+        await clockA.stop()
+        await clockB.stop()
     }
 
     @Test("Two peers fire near-simultaneously at the same synced time")
     func twoPeersFireTogether() async throws {
         let network = MockNetwork()
-        let a = PeerClock(transportFactory: { id in
+        let config = Self.fastSyncConfig()
+        let a = PeerClock(configuration: config, transportFactory: { id in
             MockTransport(localPeerID: id, network: network)
         })
-        let b = PeerClock(transportFactory: { id in
+        let b = PeerClock(configuration: config, transportFactory: { id in
             MockTransport(localPeerID: id, network: network)
         })
         try await a.start()
         try await b.start()
 
         // 同期が収束するまで待つ
-        try await Task.sleep(nanoseconds: 1_500_000_000)
+        await Self.waitForSync(a); await Self.waitForSync(b)
 
         actor Times {
             var marks: [(String, UInt64)] = []
