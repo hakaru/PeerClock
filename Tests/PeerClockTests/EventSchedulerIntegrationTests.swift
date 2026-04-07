@@ -35,12 +35,9 @@ struct EventSchedulerIntegrationTests {
         }
     }
 
-    /// Return whichever of the two peers is the current coordinator (which is
-    /// always considered synchronized in a 2-peer cluster). The non-coordinator
-    /// may fail to complete an actual sync round due to a preexisting race in
-    /// CommandRouter.syncMessages (syncResponder task and follower listener
-    /// compete for the same AsyncStream). Tests that need a synchronized peer
-    /// should use this helper.
+    /// Return whichever of the two peers is the current coordinator in a
+    /// 2-peer cluster. Tests that only need one synchronized peer can use this
+    /// helper instead of branching on leadership directly.
     private static func coordinatorPeer(_ a: PeerClock, _ b: PeerClock) -> PeerClock {
         a.coordinatorID == a.localPeerID ? a : b
     }
@@ -111,10 +108,48 @@ struct EventSchedulerIntegrationTests {
         await clockB.stop()
     }
 
-    // Note: The "two peers fire together" test is intentionally removed because
-    // it requires both peers (coordinator AND follower) to be synchronized, but
-    // the follower may hit the preexisting CommandRouter.syncMessages race
-    // (Problem 2 in the debug-specialist report). That race predates Phase 3.6
-    // and warrants a separate structural fix. PeerClockSyncGuardTests covers
-    // the sync-guard and fire-path semantics via coordinator-side scheduling.
+    @Test("two peers fire together")
+    func twoPeersFireTogether() async throws {
+        let network = MockNetwork()
+        let config = Self.fastSyncConfig()
+        let clockA = PeerClock(configuration: config, transportFactory: { id in
+            MockTransport(localPeerID: id, network: network)
+        })
+        let clockB = PeerClock(configuration: config, transportFactory: { id in
+            MockTransport(localPeerID: id, network: network)
+        })
+        try await clockA.start()
+        try await clockB.start()
+        await Self.waitForSync(clockA)
+        await Self.waitForSync(clockB)
+
+        #expect(clockA.currentSync.isSynchronized == true)
+        #expect(clockB.currentSync.isSynchronized == true)
+
+        let boxA = Box()
+        let boxB = Box()
+        let target = max(clockA.now, clockB.now) + 150_000_000
+
+        _ = try await clockA.schedule(atSyncedTime: target) {
+            let t = NTPSyncEngine.now()
+            Task { await boxA.mark(t) }
+        }
+        _ = try await clockB.schedule(atSyncedTime: target) {
+            let t = NTPSyncEngine.now()
+            Task { await boxB.mark(t) }
+        }
+
+        try await Task.sleep(nanoseconds: 450_000_000)
+
+        #expect(await boxA.read() == true)
+        #expect(await boxB.read() == true)
+
+        let firedAtA = await boxA.readAt()
+        let firedAtB = await boxB.readAt()
+        let delta = firedAtA >= firedAtB ? firedAtA - firedAtB : firedAtB - firedAtA
+        #expect(delta <= 50_000_000)
+
+        await clockA.stop()
+        await clockB.stop()
+    }
 }

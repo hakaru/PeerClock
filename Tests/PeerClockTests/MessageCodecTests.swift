@@ -27,16 +27,46 @@ struct MessageCodecTests {
 
     @Test("COMMAND_BROADCAST round-trips")
     func commandBroadcastRoundTrip() throws {
-        let message = Message.commandBroadcast(Command(type: "broadcast", payload: Data([0xAA, 0xBB])))
+        let commandID = UUID()
+        let senderID = PeerID(rawValue: UUID(uuidString: "00000000-0000-0000-0000-000000000002")!)
+        let message = Message.commandBroadcast(
+            commandID: commandID,
+            logicalVersion: 42,
+            senderID: senderID,
+            command: Command(type: "broadcast", payload: Data([0xAA, 0xBB]))
+        )
         let decoded = try roundTrip(message)
-        #expect(decoded == message)
+        guard case .commandBroadcast(let returnedID, let version, let returnedSender, let command) = decoded else {
+            Issue.record("decoded wrong case")
+            return
+        }
+        #expect(returnedID == commandID)
+        #expect(version == 42)
+        #expect(returnedSender == senderID)
+        #expect(command.type == "broadcast")
+        #expect(command.payload == Data([0xAA, 0xBB]))
     }
 
     @Test("COMMAND_UNICAST round-trips")
     func commandUnicastRoundTrip() throws {
-        let message = Message.commandUnicast(Command(type: "unicast", payload: Data([0x10, 0x20])))
+        let commandID = UUID()
+        let senderID = PeerID(rawValue: UUID(uuidString: "00000000-0000-0000-0000-000000000003")!)
+        let message = Message.commandUnicast(
+            commandID: commandID,
+            logicalVersion: 7,
+            senderID: senderID,
+            command: Command(type: "unicast", payload: Data([0x10, 0x20]))
+        )
         let decoded = try roundTrip(message)
-        #expect(decoded == message)
+        guard case .commandUnicast(let returnedID, let version, let returnedSender, let command) = decoded else {
+            Issue.record("decoded wrong case")
+            return
+        }
+        #expect(returnedID == commandID)
+        #expect(version == 7)
+        #expect(returnedSender == senderID)
+        #expect(command.type == "unicast")
+        #expect(command.payload == Data([0x10, 0x20]))
     }
 
     @Test("HEARTBEAT round-trips")
@@ -55,7 +85,7 @@ struct MessageCodecTests {
     func headerSize() {
         let encoded = MessageCodec.encode(.heartbeat)
         #expect(encoded.count == 5)
-        #expect(encoded[0] == 0x01)
+        #expect(encoded[0] == 0x02)
         #expect(encoded[1] == 0x20)
         #expect(encoded[2] == 0x00)
         #expect(encoded[3] == 0x00)
@@ -64,7 +94,7 @@ struct MessageCodecTests {
 
     @Test("Decode rejects unsupported version")
     func unsupportedVersion() {
-        let encoded = Data([0x02, 0x20, 0x00, 0x00, 0x00])
+        let encoded = Data([0x01, 0x20, 0x00, 0x00, 0x00])
         #expect(throws: MessageCodecError.self) {
             try MessageCodec.decode(encoded)
         }
@@ -72,7 +102,7 @@ struct MessageCodecTests {
 
     @Test("Decode rejects truncated frames")
     func truncatedFrame() {
-        let encoded = Data([0x01, 0x02, 0x00, 0x18, 0x00])
+        let encoded = Data([0x02, 0x02, 0x00, 0x18, 0x00])
         #expect(throws: MessageCodecError.self) {
             try MessageCodec.decode(encoded)
         }

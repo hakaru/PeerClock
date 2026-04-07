@@ -75,13 +75,13 @@ struct NTPSyncEngineTests {
             }
         }
 
-        let clientRouter = CommandRouter(transport: clientTransport)
+        let clientRouter = CommandRouter(transport: clientTransport, localPeerID: clientID)
         let config = Configuration(syncMeasurements: 4, syncMeasurementInterval: 0.01)
         let engine = NTPSyncEngine(
             transport: clientTransport,
             localPeerID: clientID,
             configuration: config,
-            syncMessageStream: clientRouter.syncMessages
+            syncResponseStream: clientRouter.syncResponses
         )
         _ = clientRouter // 保持して読み取りタスクを生かす
         await engine.start(coordinator: coordinatorID)
@@ -123,7 +123,7 @@ struct NTPSyncEngineTests {
             }
         }
 
-        let clientRouter = CommandRouter(transport: clientTransport)
+        let clientRouter = CommandRouter(transport: clientTransport, localPeerID: clientID)
         let config = Configuration(
             syncBackoffStages: [0.05, 0.5, 1.0],
             syncBackoffPromoteAfter: 2,
@@ -134,7 +134,7 @@ struct NTPSyncEngineTests {
             transport: clientTransport,
             localPeerID: clientID,
             configuration: config,
-            syncMessageStream: clientRouter.syncMessages
+            syncResponseStream: clientRouter.syncResponses
         )
         _ = clientRouter
         await engine.start(coordinator: coordinatorID)
@@ -157,12 +157,12 @@ struct NTPSyncEngineTests {
         let localID = PeerID(rawValue: UUID())
         let coordA = PeerID(rawValue: UUID())
         let transport = await network.createTransport(for: localID)
-        let router = CommandRouter(transport: transport)
+        let router = CommandRouter(transport: transport, localPeerID: localID)
         let engine = NTPSyncEngine(
             transport: transport,
             localPeerID: localID,
             configuration: .default,
-            syncMessageStream: router.syncMessages
+            syncResponseStream: router.syncResponses
         )
 
         // 1 回目の start → 即 stop (currentOffset は初期値 0 のまま)

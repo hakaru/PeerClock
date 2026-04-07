@@ -10,7 +10,7 @@ public enum MessageCodecError: Error, Sendable, Equatable {
 
 public enum MessageCodec {
 
-    private static let version: UInt8 = 0x01
+    private static let version: UInt8 = 0x02
     private static let headerSize = 5
 
     public static func encode(_ message: Message) -> Data {
@@ -52,9 +52,11 @@ public enum MessageCodec {
         case 0x03:
             return try decodePong(payload)
         case 0x10:
-            return .commandBroadcast(try decodeCommand(payload))
+            let (cid, ver, sender, cmd) = try decodeIdentifiedCommand(payload)
+            return .commandBroadcast(commandID: cid, logicalVersion: ver, senderID: sender, command: cmd)
         case 0x11:
-            return .commandUnicast(try decodeCommand(payload))
+            let (cid, ver, sender, cmd) = try decodeIdentifiedCommand(payload)
+            return .commandUnicast(commandID: cid, logicalVersion: ver, senderID: sender, command: cmd)
         case 0x20:
             guard payload.isEmpty else { throw MessageCodecError.invalidPayload }
             return .heartbeat
@@ -91,8 +93,14 @@ public enum MessageCodec {
             data.append(contentsOf: encodeUInt64(t1))
             data.append(contentsOf: encodeUInt64(t2))
             return data
-        case .commandBroadcast(let command), .commandUnicast(let command):
-            return encodeCommand(command)
+        case .commandBroadcast(let cid, let ver, let sender, let command),
+             .commandUnicast(let cid, let ver, let sender, let command):
+            var data = Data()
+            data.append(contentsOf: encodeUUID(cid))
+            data.append(contentsOf: encodeUInt64(ver))
+            data.append(sender.data)
+            data.append(encodeCommand(command))
+            return data
         case .statusPush(let senderID, let generation, let entries):
             var data = Data()
             data.append(senderID.data)
@@ -250,6 +258,45 @@ public enum MessageCodec {
 
     private static func decodeUInt16(_ data: Data, offset: Int) -> UInt16 {
         UInt16(data[offset]) << 8 | UInt16(data[offset + 1])
+    }
+
+    // MARK: - v2 Helpers
+
+    private static func encodeUUID(_ uuid: UUID) -> [UInt8] {
+        let bytes = uuid.uuid
+        return [
+            bytes.0, bytes.1, bytes.2, bytes.3,
+            bytes.4, bytes.5, bytes.6, bytes.7,
+            bytes.8, bytes.9, bytes.10, bytes.11,
+            bytes.12, bytes.13, bytes.14, bytes.15
+        ]
+    }
+
+    private static func decodeUUID(_ data: Data, offset: Int) throws -> UUID {
+        guard data.count >= offset + 16 else {
+            throw MessageCodecError.truncatedData
+        }
+        let bytes = [UInt8](data.subdata(in: offset..<(offset + 16)))
+        return UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
+    }
+
+    /// Decode [16B UUID][8B version][16B PeerID][Command] payload.
+    private static func decodeIdentifiedCommand(
+        _ payload: Data
+    ) throws -> (UUID, UInt64, PeerID, Command) {
+        let commandID = try decodeUUID(payload, offset: 0)
+        let logicalVersion = decodeUInt64(payload, offset: 16)
+        guard payload.count >= 40 else {
+            throw MessageCodecError.truncatedData
+        }
+        let senderID = try PeerID(data: payload.subdata(in: 24..<40))
+        let command = try decodeCommand(payload.subdata(in: 40..<payload.count))
+        return (commandID, logicalVersion, senderID, command)
     }
 
     private static func encodeUInt64(_ value: UInt64) -> [UInt8] {

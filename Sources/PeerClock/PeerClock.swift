@@ -167,14 +167,14 @@ public final class PeerClock: @unchecked Sendable {
             let elec = CoordinatorElection(localPeerID: localPeerID)
             self.election = elec
 
-            let router = CommandRouter(transport: newTransport)
+            let router = CommandRouter(transport: newTransport, localPeerID: localPeerID)
             self.commandRouter = router
 
             let eng = NTPSyncEngine(
                 transport: newTransport,
                 localPeerID: localPeerID,
                 configuration: configuration,
-                syncMessageStream: router.syncMessages
+                syncResponseStream: router.syncResponses
             )
             self.syncEngine = eng
 
@@ -243,6 +243,8 @@ public final class PeerClock: @unchecked Sendable {
             guard let self else { return }
             for await event in heartbeat.events {
                 if case .disconnected = event.state {
+                    let router = self.lock.withLock { self.commandRouter }
+                    router?.forgetPeer(event.peerID)
                     await self.reevaluateCoordination()
                 }
             }
@@ -635,7 +637,7 @@ public final class PeerClock: @unchecked Sendable {
         }
         existing?.cancel()
 
-        let syncStream = lock.withLock { commandRouter?.syncMessages }
+        let syncStream = lock.withLock { commandRouter?.syncRequests }
         guard let syncStream else { return }
         let task = Task { [weak self] in
             guard let self else { return }
