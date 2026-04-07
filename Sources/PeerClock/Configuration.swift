@@ -3,11 +3,28 @@ import Foundation
 /// Runtime configuration for a PeerClock instance.
 public struct Configuration: Sendable {
 
+    // MARK: - Heartbeat
+
     /// Interval in seconds between heartbeat packets.
     public let heartbeatInterval: TimeInterval
 
-    /// Number of missed heartbeats before a peer is considered disconnected.
-    public let disconnectThreshold: Int
+    /// After this many seconds with no heartbeat, a peer is marked `.degraded`.
+    public let degradedAfter: TimeInterval
+
+    /// After this many seconds with no heartbeat, a peer is marked `.disconnected`.
+    public let disconnectedAfter: TimeInterval
+
+    // MARK: - Status debounce
+
+    /// Send-side debounce window. `setStatus` calls within this window are
+    /// flushed into a single STATUS_PUSH.
+    public let statusSendDebounce: TimeInterval
+
+    /// Receive-side debounce window. `statusUpdates` events for the same peer
+    /// within this window are collapsed to one.
+    public let statusReceiveDebounce: TimeInterval
+
+    // MARK: - Clock sync
 
     /// Interval in seconds between sync rounds.
     public let syncInterval: TimeInterval
@@ -18,6 +35,8 @@ public struct Configuration: Sendable {
     /// Interval in seconds between individual measurements within a sync round.
     public let syncMeasurementInterval: TimeInterval
 
+    // MARK: - Transport
+
     /// Bonjour service type string.
     public let serviceType: String
 
@@ -26,7 +45,10 @@ public struct Configuration: Sendable {
 
     public init(
         heartbeatInterval: TimeInterval = 1.0,
-        disconnectThreshold: Int = 3,
+        degradedAfter: TimeInterval = 2.0,
+        disconnectedAfter: TimeInterval = 5.0,
+        statusSendDebounce: TimeInterval = 0.1,
+        statusReceiveDebounce: TimeInterval = 0.05,
         syncInterval: TimeInterval = 5.0,
         syncMeasurements: Int = 40,
         syncMeasurementInterval: TimeInterval = 0.03,
@@ -34,7 +56,10 @@ public struct Configuration: Sendable {
         protocolVersion: UInt16 = 1
     ) {
         self.heartbeatInterval = heartbeatInterval
-        self.disconnectThreshold = disconnectThreshold
+        self.degradedAfter = degradedAfter
+        self.disconnectedAfter = disconnectedAfter
+        self.statusSendDebounce = statusSendDebounce
+        self.statusReceiveDebounce = statusReceiveDebounce
         self.syncInterval = syncInterval
         self.syncMeasurements = syncMeasurements
         self.syncMeasurementInterval = syncMeasurementInterval

@@ -105,21 +105,37 @@ struct ContentView: View {
 
     private var peersSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Peers (\(viewModel.peers.count))")
+            Text("Peers (\(viewModel.remotePeers.count))")
                 .font(.headline)
 
-            if viewModel.peers.isEmpty {
+            if viewModel.remotePeers.isEmpty {
                 Text("No peers connected")
                     .foregroundStyle(.secondary)
                     .font(.caption)
             } else {
-                ForEach(viewModel.peers, id: \.self) { peer in
-                    HStack {
-                        Image(systemName: "iphone")
-                        Text(peer)
-                            .font(.system(.body, design: .monospaced))
-                        Spacer()
+                ForEach(viewModel.remotePeers) { peer in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Image(systemName: "iphone")
+                            Text(peer.name)
+                                .font(.system(.caption, design: .monospaced))
+                            Spacer()
+                            Text(connectionLabel(peer.connectionState))
+                                .font(.caption2)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 2)
+                                .background(connectionColor(peer.connectionState).opacity(0.2))
+                                .foregroundStyle(connectionColor(peer.connectionState))
+                                .clipShape(Capsule())
+                        }
+                        if peer.statusSummary != "-" && !peer.statusSummary.isEmpty {
+                            Text(peer.statusSummary)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .padding(.leading, 22)
+                        }
                     }
+                    .padding(.vertical, 2)
                 }
             }
         }
@@ -202,6 +218,22 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(.secondarySystemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func connectionLabel(_ state: ConnectionState) -> String {
+        switch state {
+        case .connected: return "connected"
+        case .degraded: return "degraded"
+        case .disconnected: return "disconnected"
+        }
+    }
+
+    private func connectionColor(_ state: ConnectionState) -> Color {
+        switch state {
+        case .connected: return .green
+        case .degraded: return .orange
+        case .disconnected: return .red
+        }
     }
 
     private var isRunning: Bool {

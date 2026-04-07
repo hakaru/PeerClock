@@ -32,7 +32,7 @@ public enum ConnectionState: Sendable, Equatable {
 // MARK: - SyncQuality
 
 /// Metrics describing the quality of clock synchronization.
-public struct SyncQuality: Sendable, Equatable {
+public struct SyncQuality: Sendable, Equatable, Codable {
     /// Clock offset relative to peer in nanoseconds.
     public let offsetNs: Int64
     /// Round-trip communication delay in nanoseconds.

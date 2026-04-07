@@ -158,6 +158,11 @@ public final class MockTransport: Transport, @unchecked Sendable {
         )
     }
 
+    // Phase 2a: same path as reliable; tests don't yet distinguish channels.
+    public func broadcastUnreliable(_ data: Data) async throws {
+        try await broadcast(data)
+    }
+
     fileprivate func updatePeers(_ peers: Set<PeerID>) {
         peersContinuation.yield(peers)
     }
