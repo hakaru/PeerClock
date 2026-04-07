@@ -35,6 +35,12 @@ public final class PeerClock: @unchecked Sendable {
         return UInt64(Int64(machNow) + offsetNs)
     }
 
+    /// 現在選出されている sync coordinator の PeerID。未選出時は nil。
+    /// デバッグ・可視化用途。通常のアプリロジックはこの値を気にする必要はない。
+    public var coordinatorID: PeerID? {
+        lock.withLock { currentCoordinator }
+    }
+
     // MARK: - Private: Configuration
 
     private let configuration: Configuration

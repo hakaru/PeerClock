@@ -192,7 +192,7 @@ public struct Configuration: Sendable {
         syncInterval: TimeInterval = 5.0,
         syncMeasurements: Int = 40,
         syncMeasurementInterval: TimeInterval = 0.03,
-        serviceName: String = "_peerclock._udp"
+        serviceName: String = "_peerclock._tcp"
     ) {
         self.heartbeatInterval = heartbeatInterval
         self.disconnectThreshold = disconnectThreshold

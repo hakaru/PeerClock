@@ -50,7 +50,7 @@ struct TypesTests {
         #expect(config.syncInterval == 5.0)
         #expect(config.syncMeasurements == 40)
         #expect(config.syncMeasurementInterval == 0.03)
-        #expect(config.serviceName == "_peerclock._udp")
+        #expect(config.serviceName == "_peerclock._tcp")
     }
 
     // MARK: - SyncState
