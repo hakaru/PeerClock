@@ -7,10 +7,16 @@ public final class CommandRouter: CommandHandler, @unchecked Sendable {
     private var listenTask: Task<Void, Never>?
     private var commandContinuation: AsyncStream<(PeerID, Command)>.Continuation?
     private var syncMessageContinuation: AsyncStream<(PeerID, Message)>.Continuation?
+    private var heartbeatContinuation: AsyncStream<PeerID>.Continuation?
+    private var statusPushContinuation: AsyncStream<(PeerID, UInt64, [StatusEntry])>.Continuation?
 
     public let incomingCommands: AsyncStream<(PeerID, Command)>
     /// 同期メッセージ (PING/PONG) の単一コンシューマ制約を回避するため中央分配する。
     let syncMessages: AsyncStream<(PeerID, Message)>
+    /// 受信した HEARTBEAT メッセージの送信元 PeerID を流すストリーム。
+    let heartbeatSenders: AsyncStream<PeerID>
+    /// 受信した STATUS_PUSH の (sender, generation, entries) を流すストリーム。
+    let statusPushes: AsyncStream<(PeerID, UInt64, [StatusEntry])>
 
     public init(transport: any Transport) {
         self.transport = transport
@@ -22,6 +28,14 @@ public final class CommandRouter: CommandHandler, @unchecked Sendable {
         var syncCont: AsyncStream<(PeerID, Message)>.Continuation!
         syncMessages = AsyncStream { syncCont = $0 }
         syncMessageContinuation = syncCont
+
+        var hbCont: AsyncStream<PeerID>.Continuation!
+        heartbeatSenders = AsyncStream { hbCont = $0 }
+        heartbeatContinuation = hbCont
+
+        var spCont: AsyncStream<(PeerID, UInt64, [StatusEntry])>.Continuation!
+        statusPushes = AsyncStream { spCont = $0 }
+        statusPushContinuation = spCont
 
         startListening()
     }
@@ -46,6 +60,10 @@ public final class CommandRouter: CommandHandler, @unchecked Sendable {
                     self.commandContinuation?.yield((sender, command))
                 case .ping, .pong:
                     self.syncMessageContinuation?.yield((sender, message))
+                case .heartbeat:
+                    self.heartbeatContinuation?.yield(sender)
+                case .statusPush(_, let generation, let entries):
+                    self.statusPushContinuation?.yield((sender, generation, entries))
                 default:
                     break
                 }
@@ -57,5 +75,7 @@ public final class CommandRouter: CommandHandler, @unchecked Sendable {
         listenTask?.cancel()
         commandContinuation?.finish()
         syncMessageContinuation?.finish()
+        heartbeatContinuation?.finish()
+        statusPushContinuation?.finish()
     }
 }

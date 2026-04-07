@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// すべてのコンポーネントを統合するファサード。
 /// すべてのピアは対等であり、コーディネーターは内部で自動選出される。
@@ -54,12 +57,17 @@ public final class PeerClock: @unchecked Sendable {
     private var syncEngine: NTPSyncEngine?
     private var driftMonitor: DriftMonitor?
     private var commandRouter: CommandRouter?
+    private var statusRegistry: StatusRegistry?
+    private var statusReceiver: StatusReceiver?
+    private var heartbeatMonitor: HeartbeatMonitor?
 
     // MARK: - Private: Tasks
 
     private var coordinationTask: Task<Void, Never>?
     private var syncResponderTask: Task<Void, Never>?
     private var syncStateForwardTask: Task<Void, Never>?
+    private var heartbeatRoutingTask: Task<Void, Never>?
+    private var statusPushRoutingTask: Task<Void, Never>?
 
     // MARK: - Private: Stream Continuations
 
@@ -124,9 +132,55 @@ public final class PeerClock: @unchecked Sendable {
             return newTransport
         }
 
+        // Status / Heartbeat actors を構築（self を weak キャプチャして transport を参照）
+        let registry = StatusRegistry(
+            localPeerID: localPeerID,
+            debounce: configuration.statusSendDebounce
+        ) { [weak self] message in
+            guard let tr = self?.lock.withLock({ self?.transport }) else { return }
+            let data = MessageCodec.encode(message)
+            try await tr.broadcast(data)
+        }
+        let receiver = StatusReceiver(debounce: configuration.statusReceiveDebounce)
+        let heartbeat = HeartbeatMonitor(
+            interval: configuration.heartbeatInterval,
+            degradedAfter: configuration.degradedAfter,
+            disconnectedAfter: configuration.disconnectedAfter
+        ) { [weak self] in
+            guard let tr = self?.lock.withLock({ self?.transport }) else { return }
+            let data = MessageCodec.encode(Message.heartbeat)
+            try await tr.broadcastUnreliable(data)
+        }
+        lock.withLock {
+            self.statusRegistry = registry
+            self.statusReceiver = receiver
+            self.heartbeatMonitor = heartbeat
+        }
+
         try await tr.start()
 
         syncStateContinuation.yield(.discovering)
+
+        // HeartbeatMonitor を開始
+        await heartbeat.start()
+
+        // ルーティングタスク: heartbeat
+        let router = lock.withLock { commandRouter! }
+        let hbRoutingTask = Task {
+            for await sender in router.heartbeatSenders {
+                await heartbeat.heartbeatReceived(from: sender)
+            }
+        }
+        // ルーティングタスク: statusPush
+        let spRoutingTask = Task {
+            for await (sender, generation, entries) in router.statusPushes {
+                _ = await receiver.ingestPush(from: sender, generation: generation, entries: entries)
+            }
+        }
+        lock.withLock {
+            self.heartbeatRoutingTask = hbRoutingTask
+            self.statusPushRoutingTask = spRoutingTask
+        }
 
         // syncEngine のステート更新を転送するタスク
         let eng = lock.withLock { syncEngine! }
@@ -135,12 +189,25 @@ public final class PeerClock: @unchecked Sendable {
         let forwardTask = Task {
             for await state in eng.syncStateUpdates {
                 cont.yield(state)
-                if case .synced(let offset, _) = state {
+                if case .synced(let offset, let quality) = state {
                     dm.recordOffset(offset * 1_000_000_000)
+                    let offsetNs = Int64(offset * 1_000_000_000)
+                    try? await registry.setStatus(offsetNs, forKey: StatusKeys.syncOffset)
+                    try? await registry.setStatus(quality, forKey: StatusKeys.syncQuality)
                 }
             }
         }
         lock.withLock { self.syncStateForwardTask = forwardTask }
+
+        // デバイス名を一度だけ配信
+        let deviceName: String = {
+            #if canImport(UIKit)
+            return UIDevice.current.name
+            #else
+            return Host.current().localizedName ?? "Mac"
+            #endif
+        }()
+        try? await registry.setStatus(deviceName, forKey: StatusKeys.deviceName)
 
         // メイン協調タスクを開始
         let coordTask = Task { [weak self] in
@@ -152,27 +219,36 @@ public final class PeerClock: @unchecked Sendable {
 
     /// 同期を停止する
     public func stop() async {
-        let (coordTask, syncResponder, fwdTask, eng, tr) = lock.withLock {
-            let c = coordinationTask
-            coordinationTask = nil
-            let s = syncResponderTask
-            syncResponderTask = nil
-            let f = syncStateForwardTask
-            syncStateForwardTask = nil
+        let (coordTask, syncResponder, fwdTask, hbTask, spTask, eng, tr, registry, receiver, heartbeat) = lock.withLock {
+            let c = coordinationTask; coordinationTask = nil
+            let s = syncResponderTask; syncResponderTask = nil
+            let f = syncStateForwardTask; syncStateForwardTask = nil
+            let h = heartbeatRoutingTask; heartbeatRoutingTask = nil
+            let sp = statusPushRoutingTask; statusPushRoutingTask = nil
             let e = syncEngine
             let t = transport
-            return (c, s, f, e, t)
+            let reg = statusRegistry; statusRegistry = nil
+            let rec = statusReceiver; statusReceiver = nil
+            let hb = heartbeatMonitor; heartbeatMonitor = nil
+            return (c, s, f, h, sp, e, t, reg, rec, hb)
         }
 
         coordTask?.cancel()
         syncResponder?.cancel()
         fwdTask?.cancel()
+        hbTask?.cancel()
+        spTask?.cancel()
 
         await coordTask?.value
         await syncResponder?.value
         await fwdTask?.value
+        await hbTask?.value
+        await spTask?.value
 
         await eng?.stop()
+        await registry?.shutdown()
+        await receiver?.shutdown()
+        await heartbeat?.stop()
         await tr?.stop()
 
         syncStateContinuation.yield(.idle)
@@ -190,27 +266,84 @@ public final class PeerClock: @unchecked Sendable {
         try await router.broadcast(command)
     }
 
+    // MARK: - Status API
+
+    /// 生バイト列のステータス値をセットする。フラッシュはデバウンスされる。
+    public func setStatus(_ data: Data, forKey key: String) async {
+        let registry = lock.withLock { statusRegistry }
+        await registry?.setStatus(data, forKey: key)
+    }
+
+    /// Codable なステータス値をセットする（binary plist エンコード）。エンコード失敗時に throw。
+    public func setStatus<T: Codable & Sendable>(_ value: T, forKey key: String) async throws {
+        guard let registry = lock.withLock({ statusRegistry }) else { return }
+        try await registry.setStatus(value, forKey: key)
+    }
+
+    /// 指定ピアの最新ステータスを返す。
+    public func status(of peer: PeerID) async -> RemotePeerStatus? {
+        let receiver = lock.withLock { statusReceiver }
+        return await receiver?.status(of: peer)
+    }
+
+    /// デバウンスされたリモートステータス更新ストリーム。
+    public var statusUpdates: AsyncStream<RemotePeerStatus> {
+        lock.withLock { statusReceiver }?.updates ?? AsyncStream { $0.finish() }
+    }
+
+    /// 指定ピアのハートビート由来の接続状態を返す。
+    public func connectionState(of peer: PeerID) async -> ConnectionState? {
+        let hb = lock.withLock { heartbeatMonitor }
+        return await hb?.currentState(of: peer)
+    }
+
+    /// ハートビート接続状態遷移ストリーム。
+    public var connectionEvents: AsyncStream<HeartbeatMonitor.Event> {
+        lock.withLock { heartbeatMonitor }?.events ?? AsyncStream { $0.finish() }
+    }
+
     // MARK: - Private: Coordination Loop
 
     private func runCoordinationLoop(transport: any Transport) async {
         for await peers in transport.peers {
             guard !Task.isCancelled else { break }
 
-            let (newPeerList, elec, eng) = lock.withLock { () -> ([PeerID], CoordinatorElection?, NTPSyncEngine?) in
+            let (newPeerList, elec, eng, hb, prevKnown) = lock.withLock {
+                () -> ([PeerID], CoordinatorElection?, NTPSyncEngine?, HeartbeatMonitor?, Set<PeerID>) in
+                let prev = knownPeers
                 knownPeers = peers
-                return (Array(peers), election, syncEngine)
+                return (Array(peers), election, syncEngine, heartbeatMonitor, prev)
             }
 
             guard let elec, let eng else { continue }
 
-            // ピアリストをストリームに流す
-            let peerList = newPeerList.map { peerID in
-                Peer(
+            // ピア追加/削除を heartbeatMonitor に通知
+            if let hb {
+                let added = peers.subtracting(prevKnown)
+                let removed = prevKnown.subtracting(peers)
+                for p in added where p != localPeerID {
+                    await hb.peerJoined(p)
+                }
+                for p in removed where p != localPeerID {
+                    await hb.peerLeft(p)
+                }
+            }
+
+            // ピアリストをストリームに流す（connectionState をハートビート由来にする）
+            var peerList: [Peer] = []
+            for peerID in newPeerList {
+                let connState: ConnectionState
+                if let hb {
+                    connState = await hb.currentState(of: peerID) ?? .connected
+                } else {
+                    connState = .connected
+                }
+                peerList.append(Peer(
                     id: peerID,
                     name: peerID.description,
                     status: PeerStatus(
                         peerID: peerID,
-                        connectionState: .connected,
+                        connectionState: connState,
                         deviceInfo: DeviceInfo(
                             name: peerID.description,
                             platform: .iOS,
@@ -218,7 +351,7 @@ public final class PeerClock: @unchecked Sendable {
                         ),
                         generation: 0
                     )
-                )
+                ))
             }
             peersContinuation.yield(peerList)
 
