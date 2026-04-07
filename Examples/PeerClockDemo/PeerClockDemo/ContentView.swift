@@ -15,12 +15,13 @@ struct ContentView: View {
                         Text("Transport")
                             .font(.headline)
                         Spacer()
-                        Picker("", selection: $viewModel.useMultipeerConnectivity) {
-                            Text("WiFi").tag(false)
-                            Text("MC").tag(true)
+                        Picker("", selection: $viewModel.transportMode) {
+                            ForEach(PeerClockViewModel.TransportMode.allCases, id: \.self) { mode in
+                                Text(mode.rawValue).tag(mode)
+                            }
                         }
                         .pickerStyle(.segmented)
-                        .frame(width: 140)
+                        .frame(width: 200)
                         .disabled(!viewModel.isStopped)
                     }
                     .padding(.horizontal)
@@ -83,6 +84,13 @@ struct ContentView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+            }
+
+            if viewModel.transportMode == .auto,
+               let label = viewModel.activeTransportLabel {
+                Text("via \(label)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
 
             HStack {

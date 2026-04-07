@@ -4,7 +4,7 @@ import Network
 /// Network.framework transport used on real devices.
 ///
 /// Phase 1.1 only needs this type to satisfy the transport surface; tests use `MockTransport`.
-final class WiFiTransport: Transport, @unchecked Sendable {
+public final class WiFiTransport: Transport, @unchecked Sendable {
 
     private let localPeerID: PeerID
     private let configuration: Configuration
@@ -16,13 +16,13 @@ final class WiFiTransport: Transport, @unchecked Sendable {
     private var peerSnapshots: Set<PeerID> = []
     private var discoveryTask: Task<Void, Never>?
 
-    let peers: AsyncStream<Set<PeerID>>
-    let incomingMessages: AsyncStream<(PeerID, Data)>
+    public let peers: AsyncStream<Set<PeerID>>
+    public let incomingMessages: AsyncStream<(PeerID, Data)>
 
     private let peersContinuation: AsyncStream<Set<PeerID>>.Continuation
     private let incomingMessagesContinuation: AsyncStream<(PeerID, Data)>.Continuation
 
-    init(localPeerID: PeerID, configuration: Configuration) {
+    public init(localPeerID: PeerID, configuration: Configuration) {
         self.localPeerID = localPeerID
         self.configuration = configuration
 
@@ -35,7 +35,7 @@ final class WiFiTransport: Transport, @unchecked Sendable {
         self.incomingMessagesContinuation = incomingContinuation
     }
 
-    func start() async throws {
+    public func start() async throws {
         let discovery = try Discovery(serviceType: configuration.serviceType, localPeerID: localPeerID)
         discovery.inboundConnectionHandler = { [weak self] connection in
             self?.handleInboundConnection(connection)
@@ -61,7 +61,7 @@ final class WiFiTransport: Transport, @unchecked Sendable {
         }
     }
 
-    func stop() async {
+    public func stop() async {
         let (connections, task, discovery) = lock.withLock { () -> ([NWConnection], Task<Void, Never>?, Discovery?) in
             let connections = Array(self.connections.values)
             self.connections.removeAll()
@@ -80,7 +80,7 @@ final class WiFiTransport: Transport, @unchecked Sendable {
         incomingMessagesContinuation.finish()
     }
 
-    func send(_ data: Data, to peer: PeerID) async throws {
+    public func send(_ data: Data, to peer: PeerID) async throws {
         guard let connection = lock.withLock({ connections[peer] }) else {
             return
         }
@@ -97,7 +97,7 @@ final class WiFiTransport: Transport, @unchecked Sendable {
         }
     }
 
-    func broadcast(_ data: Data) async throws {
+    public func broadcast(_ data: Data) async throws {
         let peers = lock.withLock { Array(peerSnapshots) }
         for peer in peers {
             try await send(data, to: peer)
