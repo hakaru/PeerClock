@@ -213,8 +213,9 @@ public final class PeerClock: @unchecked Sendable {
 
         // DriftMonitor のジャンプを EventScheduler に転送するタスク
         let scheduler = lock.withLock { eventScheduler! }
-        let driftJumpTask = Task {
+        let driftJumpTask = Task { [weak eng] in
             for await jump in dm.jumps {
+                eng?.resetBackoff()
                 await scheduler.handleJump(
                     oldOffsetNs: jump.oldOffsetNs,
                     newOffsetNs: jump.newOffsetNs
