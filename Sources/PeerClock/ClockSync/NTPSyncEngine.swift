@@ -61,7 +61,10 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
     // MARK: - SyncEngine
 
     public func start(coordinator: PeerID) async {
-        lock.withLock { self.coordinatorID = coordinator }
+        lock.withLock {
+            self.coordinatorID = coordinator
+            self._currentOffset = 0.0
+        }
         syncStateContinuation.yield(.syncing)
 
         let task = Task { [weak self] in

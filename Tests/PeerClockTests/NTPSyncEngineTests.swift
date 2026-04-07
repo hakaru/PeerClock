@@ -96,4 +96,30 @@ struct NTPSyncEngineTests {
         await clientTransport.stop()
         responderTask.cancel()
     }
+
+    @Test("start() resets currentOffset from previous session")
+    func startResetsCurrentOffset() async {
+        let network = MockNetwork()
+        let localID = PeerID(rawValue: UUID())
+        let coordA = PeerID(rawValue: UUID())
+        let transport = await network.createTransport(for: localID)
+        let router = CommandRouter(transport: transport)
+        let engine = NTPSyncEngine(
+            transport: transport,
+            localPeerID: localID,
+            configuration: .default,
+            syncMessageStream: router.syncMessages
+        )
+
+        // 1 回目の start → 即 stop (currentOffset は初期値 0 のまま)
+        await engine.start(coordinator: coordA)
+        #expect(engine.currentOffset == 0.0)
+        await engine.stop()
+
+        // 2 回目の start (異なる coordinator) → currentOffset が再び 0 にリセットされる
+        let coordB = PeerID(rawValue: UUID())
+        await engine.start(coordinator: coordB)
+        #expect(engine.currentOffset == 0.0)
+        await engine.stop()
+    }
 }
