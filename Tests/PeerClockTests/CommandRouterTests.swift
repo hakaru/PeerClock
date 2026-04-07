@@ -13,8 +13,8 @@ struct CommandRouterTests {
         let transportB = await network.createTransport(for: peerB)
         try await transportA.start()
         try await transportB.start()
-        let routerA = CommandRouter(transport: transportA)
-        let routerB = CommandRouter(transport: transportB)
+        let routerA = CommandRouter(transport: transportA, localPeerID: peerA)
+        let routerB = CommandRouter(transport: transportB, localPeerID: peerB)
 
         let receiveTask = Task<(PeerID, Command)?, Never> {
             for await (sender, cmd) in routerB.incomingCommands { return (sender, cmd) }
@@ -43,9 +43,9 @@ struct CommandRouterTests {
         try await transportA.start()
         try await transportB.start()
         try await transportC.start()
-        let routerA = CommandRouter(transport: transportA)
-        let routerB = CommandRouter(transport: transportB)
-        let routerC = CommandRouter(transport: transportC)
+        let routerA = CommandRouter(transport: transportA, localPeerID: peerA)
+        let routerB = CommandRouter(transport: transportB, localPeerID: peerB)
+        let routerC = CommandRouter(transport: transportC, localPeerID: peerC)
         let taskB = Task<Bool, Never> {
             for await (_, cmd) in routerB.incomingCommands {
                 if cmd.type == "com.test.broadcast" { return true }

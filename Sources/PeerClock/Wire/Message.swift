@@ -4,8 +4,8 @@ public enum Message: Sendable, Equatable {
     case hello(peerID: PeerID, protocolVersion: UInt16)
     case ping(peerID: PeerID, t0: UInt64)
     case pong(peerID: PeerID, t0: UInt64, t1: UInt64, t2: UInt64)
-    case commandBroadcast(Command)
-    case commandUnicast(Command)
+    case commandBroadcast(commandID: UUID, logicalVersion: UInt64, senderID: PeerID, command: Command)
+    case commandUnicast(commandID: UUID, logicalVersion: UInt64, senderID: PeerID, command: Command)
     case heartbeat
     case statusPush(senderID: PeerID, generation: UInt64, entries: [StatusEntry])
     case statusRequest(senderID: PeerID, correlation: UInt16)

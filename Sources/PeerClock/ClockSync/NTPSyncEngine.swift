@@ -20,7 +20,7 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
     private let configuration: Configuration
     private let localPeerID: PeerID
     /// transport の単一コンシューマ制約を避けるため CommandRouter 経由で受信する。
-    private let syncMessageStream: AsyncStream<(PeerID, Message)>
+    private let syncResponseStream: AsyncStream<(PeerID, Message)>
 
     /// ロック保護されたクロックオフセット (秒単位)
     private let lock = NSLock()
@@ -48,12 +48,12 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
         transport: any Transport,
         localPeerID: PeerID,
         configuration: Configuration = .default,
-        syncMessageStream: AsyncStream<(PeerID, Message)>
+        syncResponseStream: AsyncStream<(PeerID, Message)>
     ) {
         self.transport = transport
         self.localPeerID = localPeerID
         self.configuration = configuration
-        self.syncMessageStream = syncMessageStream
+        self.syncResponseStream = syncResponseStream
         self.backoff = BackoffController(
             stages: configuration.syncBackoffStages,
             promoteAfter: configuration.syncBackoffPromoteAfter
@@ -153,7 +153,7 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
         let collector = MeasurementCollector()
 
         // レスポンスリスナータスク (CommandRouter 経由で配信される sync メッセージを受信)
-        let stream = self.syncMessageStream
+        let stream = self.syncResponseStream
         let listenerTask = Task {
             for await (sender, message) in stream {
                 guard sender == coordinator else { continue }
