@@ -109,6 +109,7 @@ public final class PeerClock: @unchecked Sendable {
 
             let eng = NTPSyncEngine(
                 transport: newTransport,
+                localPeerID: localPeerID,
                 configuration: configuration,
                 syncMessageStream: router.syncMessages
             )
@@ -123,7 +124,7 @@ public final class PeerClock: @unchecked Sendable {
             return newTransport
         }
 
-        try tr.start()
+        try await tr.start()
 
         syncStateContinuation.yield(.discovering)
 
@@ -172,7 +173,7 @@ public final class PeerClock: @unchecked Sendable {
         await fwdTask?.value
 
         await eng?.stop()
-        tr?.stop()
+        await tr?.stop()
 
         syncStateContinuation.yield(.idle)
     }
@@ -192,19 +193,12 @@ public final class PeerClock: @unchecked Sendable {
     // MARK: - Private: Coordination Loop
 
     private func runCoordinationLoop(transport: any Transport) async {
-        for await event in transport.connectionEvents {
+        for await peers in transport.peers {
             guard !Task.isCancelled else { break }
 
             let (newPeerList, elec, eng) = lock.withLock { () -> ([PeerID], CoordinatorElection?, NTPSyncEngine?) in
-                switch event {
-                case .peerJoined(let peerID):
-                    knownPeers.insert(peerID)
-                case .peerLeft(let peerID):
-                    knownPeers.remove(peerID)
-                case .transportDegraded, .transportRestored:
-                    break
-                }
-                return (Array(knownPeers), election, syncEngine)
+                knownPeers = peers
+                return (Array(peers), election, syncEngine)
             }
 
             guard let elec, let eng else { continue }
@@ -229,7 +223,7 @@ public final class PeerClock: @unchecked Sendable {
             peersContinuation.yield(peerList)
 
             // コーディネーター選出を更新
-            elec.updatePeers(newPeerList)
+            elec.updatePeers(newPeerList + [localPeerID])
             let coordinator = elec.coordinator
             let isCoord = elec.isCoordinator
 
@@ -274,20 +268,16 @@ public final class PeerClock: @unchecked Sendable {
         let syncStream = lock.withLock { commandRouter?.syncMessages }
         guard let syncStream else { return }
         let task = Task { [weak self] in
-            guard self != nil else { return }
-            for await (sender, data) in syncStream {
+            guard let self else { return }
+            for await (sender, message) in syncStream {
                 guard !Task.isCancelled else { break }
-                guard let message = try? MessageCodec.decode(data),
-                      message.category == .syncRequest,
-                      let t0 = try? MessageCodec.decodeSyncRequest(message.payload)
-                else { continue }
+                guard case .ping(_, let t0) = message else { continue }
 
                 let t1 = NTPSyncEngine.now()
                 let t2 = NTPSyncEngine.now()
-                let responsePayload = MessageCodec.encodeSyncResponse(t0: t0, t1: t1, t2: t2)
-                let response = WireMessage(category: .syncResponse, payload: responsePayload)
+                let response = Message.pong(peerID: self.localPeerID, t0: t0, t1: t1, t2: t2)
                 let responseData = MessageCodec.encode(response)
-                try? await transport.sendReliable(responseData, to: sender)
+                try? await transport.send(responseData, to: sender)
             }
         }
 

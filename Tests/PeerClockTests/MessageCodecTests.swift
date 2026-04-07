@@ -1,86 +1,84 @@
-import Testing
 import Foundation
+import Testing
 @testable import PeerClock
 
 @Suite("MessageCodec")
 struct MessageCodecTests {
 
-    @Test("Encode and decode SYNC_REQUEST")
-    func syncRequest() throws {
-        let t0: UInt64 = 1_000_000_000
-        let message = WireMessage(category: .syncRequest, payload: MessageCodec.encodeSyncRequest(t0: t0))
-        let data = MessageCodec.encode(message)
-        let decoded = try MessageCodec.decode(data)
-        #expect(decoded.category == .syncRequest)
-        let timestamps = try MessageCodec.decodeSyncRequest(decoded.payload)
-        #expect(timestamps == t0)
+    private let peerID = PeerID(rawValue: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!)
+
+    @Test("HELLO round-trips")
+    func helloRoundTrip() throws {
+        let decoded = try roundTrip(.hello(peerID: peerID, protocolVersion: 1))
+        #expect(decoded == .hello(peerID: peerID, protocolVersion: 1))
     }
 
-    @Test("Encode and decode SYNC_RESPONSE")
-    func syncResponse() throws {
-        let t0: UInt64 = 1_000_000_000
-        let t1: UInt64 = 1_000_000_500
-        let t2: UInt64 = 1_000_000_600
-        let message = WireMessage(category: .syncResponse, payload: MessageCodec.encodeSyncResponse(t0: t0, t1: t1, t2: t2))
-        let data = MessageCodec.encode(message)
-        let decoded = try MessageCodec.decode(data)
-        #expect(decoded.category == .syncResponse)
-        let (dt0, dt1, dt2) = try MessageCodec.decodeSyncResponse(decoded.payload)
-        #expect(dt0 == t0)
-        #expect(dt1 == t1)
-        #expect(dt2 == t2)
+    @Test("PING round-trips")
+    func pingRoundTrip() throws {
+        let decoded = try roundTrip(.ping(peerID: peerID, t0: 123))
+        #expect(decoded == .ping(peerID: peerID, t0: 123))
     }
 
-    @Test("Encode and decode APP_COMMAND")
-    func appCommand() throws {
-        let cmd = Command(type: "com.test.action", payload: Data([0xAA, 0xBB]))
-        let message = WireMessage(category: .appCommand, payload: MessageCodec.encodeCommand(cmd))
-        let data = MessageCodec.encode(message)
-        let decoded = try MessageCodec.decode(data)
-        #expect(decoded.category == .appCommand)
-        let decodedCmd = try MessageCodec.decodeCommand(decoded.payload)
-        #expect(decodedCmd.type == "com.test.action")
-        #expect(decodedCmd.payload == Data([0xAA, 0xBB]))
+    @Test("PONG round-trips")
+    func pongRoundTrip() throws {
+        let decoded = try roundTrip(.pong(peerID: peerID, t0: 1, t1: 2, t2: 3))
+        #expect(decoded == .pong(peerID: peerID, t0: 1, t1: 2, t2: 3))
     }
 
-    @Test("Encode and decode ELECTION")
-    func election() throws {
-        let peerID = PeerID(rawValue: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!)
-        let message = WireMessage(category: .election, payload: MessageCodec.encodeElection(coordinatorID: peerID))
-        let data = MessageCodec.encode(message)
-        let decoded = try MessageCodec.decode(data)
-        #expect(decoded.category == .election)
-        let decodedID = try MessageCodec.decodeElection(decoded.payload)
-        #expect(decodedID == peerID)
+    @Test("COMMAND_BROADCAST round-trips")
+    func commandBroadcastRoundTrip() throws {
+        let message = Message.commandBroadcast(Command(type: "broadcast", payload: Data([0xAA, 0xBB])))
+        let decoded = try roundTrip(message)
+        #expect(decoded == message)
     }
 
-    @Test("Header is 5 bytes: version(1) + category(1) + flags(1) + length(2)")
+    @Test("COMMAND_UNICAST round-trips")
+    func commandUnicastRoundTrip() throws {
+        let message = Message.commandUnicast(Command(type: "unicast", payload: Data([0x10, 0x20])))
+        let decoded = try roundTrip(message)
+        #expect(decoded == message)
+    }
+
+    @Test("HEARTBEAT round-trips")
+    func heartbeatRoundTrip() throws {
+        let decoded = try roundTrip(.heartbeat)
+        #expect(decoded == .heartbeat)
+    }
+
+    @Test("DISCONNECT round-trips")
+    func disconnectRoundTrip() throws {
+        let decoded = try roundTrip(.disconnect)
+        #expect(decoded == .disconnect)
+    }
+
+    @Test("Header is 5 bytes")
     func headerSize() {
-        let message = WireMessage(category: .heartbeat, payload: Data())
-        let data = MessageCodec.encode(message)
-        #expect(data.count == 5)
+        let encoded = MessageCodec.encode(.heartbeat)
+        #expect(encoded.count == 5)
+        #expect(encoded[0] == 0x01)
+        #expect(encoded[1] == 0x20)
+        #expect(encoded[2] == 0x00)
+        #expect(encoded[3] == 0x00)
+        #expect(encoded[4] == 0x00)
     }
 
-    @Test("Version is 0x01")
-    func version() {
-        let message = WireMessage(category: .heartbeat, payload: Data())
-        let data = MessageCodec.encode(message)
-        #expect(data[0] == 0x01)
-    }
-
-    @Test("Decode rejects unknown version")
-    func unknownVersion() {
-        let data = Data([0x02, 0x30, 0x00, 0x00, 0x00])
+    @Test("Decode rejects unsupported version")
+    func unsupportedVersion() {
+        let encoded = Data([0x02, 0x20, 0x00, 0x00, 0x00])
         #expect(throws: MessageCodecError.self) {
-            try MessageCodec.decode(data)
+            try MessageCodec.decode(encoded)
         }
     }
 
-    @Test("Decode rejects truncated data")
-    func truncatedData() {
-        let data = Data([0x01, 0x01])
+    @Test("Decode rejects truncated frames")
+    func truncatedFrame() {
+        let encoded = Data([0x01, 0x02, 0x00, 0x18, 0x00])
         #expect(throws: MessageCodecError.self) {
-            try MessageCodec.decode(data)
+            try MessageCodec.decode(encoded)
         }
+    }
+
+    private func roundTrip(_ message: Message) throws -> Message {
+        try MessageCodec.decode(MessageCodec.encode(message))
     }
 }

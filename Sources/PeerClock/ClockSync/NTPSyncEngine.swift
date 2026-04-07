@@ -18,8 +18,9 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
 
     private let transport: any Transport
     private let configuration: Configuration
-    /// reliableMessages を直接読まず、CommandRouter からの sync メッセージストリームを使う
-    private let syncMessageStream: AsyncStream<(PeerID, Data)>
+    private let localPeerID: PeerID
+    /// transport の単一コンシューマ制約を避けるため CommandRouter 経由で受信する。
+    private let syncMessageStream: AsyncStream<(PeerID, Message)>
 
     /// ロック保護されたクロックオフセット (秒単位)
     private let lock = NSLock()
@@ -43,10 +44,12 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
 
     public init(
         transport: any Transport,
+        localPeerID: PeerID,
         configuration: Configuration = .default,
-        syncMessageStream: AsyncStream<(PeerID, Data)>
+        syncMessageStream: AsyncStream<(PeerID, Message)>
     ) {
         self.transport = transport
+        self.localPeerID = localPeerID
         self.configuration = configuration
         self.syncMessageStream = syncMessageStream
 
@@ -131,12 +134,11 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
         // レスポンスリスナータスク (CommandRouter 経由で配信される sync メッセージを受信)
         let stream = self.syncMessageStream
         let listenerTask = Task {
-            for await (sender, data) in stream {
+            for await (sender, message) in stream {
                 guard sender == coordinator else { continue }
-                guard let message = try? MessageCodec.decode(data),
-                      message.category == .syncResponse,
-                      let (t0, t1, t2) = try? MessageCodec.decodeSyncResponse(message.payload)
-                else { continue }
+                guard case .pong(_, let t0, let t1, let t2) = message else {
+                    continue
+                }
 
                 let t3 = NTPSyncEngine.now()
                 let offset = NTPSyncEngine.calculateOffset(t0: t0, t1: t1, t2: t2, t3: t3)
@@ -149,10 +151,9 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
         for _ in 0..<count {
             guard !Task.isCancelled else { break }
             let t0 = NTPSyncEngine.now()
-            let payload = MessageCodec.encodeSyncRequest(t0: t0)
-            let message = WireMessage(category: .syncRequest, payload: payload)
+            let message = Message.ping(peerID: localPeerID, t0: t0)
             let data = MessageCodec.encode(message)
-            try? await transport.sendReliable(data, to: coordinator)
+            try? await transport.send(data, to: coordinator)
 
             do {
                 try await Task.sleep(for: .seconds(interval))

@@ -55,21 +55,22 @@ struct NTPSyncEngineTests {
         let coordinatorID = PeerID(rawValue: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!)
         let clientID = PeerID(rawValue: UUID(uuidString: "00000000-0000-0000-0000-000000000002")!)
 
-        let coordinatorTransport = network.createTransport(for: coordinatorID)
-        let clientTransport = network.createTransport(for: clientID)
+        let coordinatorTransport = await network.createTransport(for: coordinatorID)
+        let clientTransport = await network.createTransport(for: clientID)
+        try await coordinatorTransport.start()
+        try await clientTransport.start()
 
         let responderTask = Task {
-            for await (sender, data) in coordinatorTransport.reliableMessages {
+            for await (sender, data) in coordinatorTransport.incomingMessages {
                 let message = try MessageCodec.decode(data)
-                if message.category == .syncRequest {
-                    let t0 = try MessageCodec.decodeSyncRequest(message.payload)
-                    let t1 = t0 + 1_000_000
-                    let t2 = t1 + 500_000
-                    let response = WireMessage(
-                        category: .syncResponse,
-                        payload: MessageCodec.encodeSyncResponse(t0: t0, t1: t1, t2: t2)
+                if case .ping(_, let t0) = message {
+                    let response = Message.pong(
+                        peerID: coordinatorID,
+                        t0: t0,
+                        t1: t0 + 1_000_000,
+                        t2: t0 + 1_500_000
                     )
-                    try await coordinatorTransport.sendReliable(MessageCodec.encode(response), to: sender)
+                    try await coordinatorTransport.send(MessageCodec.encode(response), to: sender)
                 }
             }
         }
@@ -78,6 +79,7 @@ struct NTPSyncEngineTests {
         let config = Configuration(syncMeasurements: 4, syncMeasurementInterval: 0.01)
         let engine = NTPSyncEngine(
             transport: clientTransport,
+            localPeerID: clientID,
             configuration: config,
             syncMessageStream: clientRouter.syncMessages
         )
@@ -90,6 +92,8 @@ struct NTPSyncEngineTests {
         #expect(offset != 0.0 || true) // offset depends on timing; verify it ran
 
         await engine.stop()
+        await coordinatorTransport.stop()
+        await clientTransport.stop()
         responderTask.cancel()
     }
 }

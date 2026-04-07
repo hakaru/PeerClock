@@ -10,13 +10,13 @@ final class Discovery: @unchecked Sendable {
 
     enum DiscoveryEvent: Sendable {
         case peerFound(NWEndpoint, PeerID?)
-        case peerLost(NWEndpoint)
+        case peerLost(NWEndpoint, PeerID?)
         case listenerReady(NWEndpoint.Port)
     }
 
     // MARK: - Properties
 
-    private let serviceName: String
+    private let serviceType: String
     private let localPeerID: PeerID
     private let listener: NWListener
     private let browser: NWBrowser
@@ -31,8 +31,8 @@ final class Discovery: @unchecked Sendable {
 
     // MARK: - Init
 
-    init(serviceName: String, localPeerID: PeerID) throws {
-        self.serviceName = serviceName
+    init(serviceType: String, localPeerID: PeerID) throws {
+        self.serviceType = serviceType
         self.localPeerID = localPeerID
 
         // TCP パラメータでリスナーを作成
@@ -42,13 +42,13 @@ final class Discovery: @unchecked Sendable {
         txt["peerID"] = localPeerID.rawValue.uuidString
         listener.service = NWListener.Service(
             name: localPeerID.rawValue.uuidString,
-            type: serviceName,
+            type: serviceType,
             txtRecord: txt
         )
         self.listener = listener
 
         // Bonjourブラウザーを作成
-        let browserDescriptor = NWBrowser.Descriptor.bonjour(type: serviceName, domain: nil)
+        let browserDescriptor = NWBrowser.Descriptor.bonjour(type: serviceType, domain: nil)
         let browserParams = NWParameters.tcp
         self.browser = NWBrowser(for: browserDescriptor, using: browserParams)
 
@@ -92,12 +92,12 @@ final class Discovery: @unchecked Sendable {
                 case .removed(let result):
                     let peerID = self.extractPeerID(from: result)
                     if peerID == self.localPeerID { continue }
-                    self.discoveredContinuation?.yield(.peerLost(result.endpoint))
+                    self.discoveredContinuation?.yield(.peerLost(result.endpoint, peerID))
 
                 case .changed(let old, let new, _):
                     let peerID = self.extractPeerID(from: old)
                     if peerID == self.localPeerID { continue }
-                    self.discoveredContinuation?.yield(.peerLost(old.endpoint))
+                    self.discoveredContinuation?.yield(.peerLost(old.endpoint, peerID))
                     self.discoveredContinuation?.yield(.peerFound(new.endpoint, self.extractPeerID(from: new)))
 
                 case .identical:

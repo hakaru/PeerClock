@@ -13,7 +13,8 @@ struct PeerClockTests {
     @Test("PeerClock can be initialized with default configuration")
     func initDefault() {
         let clock = PeerClock()
-        #expect(clock != nil)
+        #expect(!PeerClock.version.isEmpty)
+        _ = clock
     }
 
     @Test("Two peers discover each other and sync via MockTransport")
@@ -26,18 +27,14 @@ struct PeerClockTests {
         )
 
         let clockA = PeerClock(configuration: config, transportFactory: { peerID in
-            network.createTransport(for: peerID)
+            MockTransport(localPeerID: peerID, network: network)
         })
         let clockB = PeerClock(configuration: config, transportFactory: { peerID in
-            network.createTransport(for: peerID)
+            MockTransport(localPeerID: peerID, network: network)
         })
 
         try await clockA.start()
         try await clockB.start()
-
-        // Simulate peer discovery
-        network.simulateJoin(clockA.localPeerID)
-        network.simulateJoin(clockB.localPeerID)
 
         // Wait for sync
         try await Task.sleep(for: .milliseconds(500))
@@ -52,17 +49,14 @@ struct PeerClockTests {
         let config = Configuration(syncMeasurements: 2, syncMeasurementInterval: 0.01)
 
         let clockA = PeerClock(configuration: config, transportFactory: { peerID in
-            network.createTransport(for: peerID)
+            MockTransport(localPeerID: peerID, network: network)
         })
         let clockB = PeerClock(configuration: config, transportFactory: { peerID in
-            network.createTransport(for: peerID)
+            MockTransport(localPeerID: peerID, network: network)
         })
 
         try await clockA.start()
         try await clockB.start()
-
-        network.simulateJoin(clockA.localPeerID)
-        network.simulateJoin(clockB.localPeerID)
 
         try? await Task.sleep(for: .milliseconds(50))
 

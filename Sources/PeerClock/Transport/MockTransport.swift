@@ -1,184 +1,168 @@
 import Foundation
 
-// MARK: - MockNetwork
+public actor MockNetwork {
 
-/// テスト用の仮想ネットワーク。複数のMockTransportを管理し、ピア間のメッセージ配送をシミュレートする。
-public final class MockNetwork: Sendable {
-
-    private let state = MutableState()
+    private var transports: [PeerID: MockTransport] = [:]
 
     public init() {}
 
-    /// 指定したPeerID用のMockTransportを生成し、ネットワークに登録する。
-    public func createTransport(for peerID: PeerID) -> MockTransport {
-        let transport = MockTransport(localPeerID: peerID, network: self)
-        state.withLock { s in
-            s.transports[peerID] = transport
-        }
-        return transport
+    public func createTransport(
+        for peerID: PeerID,
+        latency: Duration = .zero,
+        packetDropProbability: Double = 0
+    ) -> MockTransport {
+        MockTransport(
+            localPeerID: peerID,
+            network: self,
+            latency: latency,
+            packetDropProbability: packetDropProbability
+        )
     }
 
-    /// 送信者から受信者へデータを配送する。
-    func deliver(from sender: PeerID, to receiver: PeerID, data: Data, reliable: Bool) {
-        let transport = state.withLock { s in s.transports[receiver] }
-        transport?.receive(from: sender, data: data, reliable: reliable)
+    func register(_ transport: MockTransport) async {
+        transports[transport.localPeerID] = transport
+        await publishPeerSnapshots()
     }
 
-    /// 送信者を除く全ピアへ信頼性のあるデータをブロードキャストする。
-    func broadcastReliable(from sender: PeerID, data: Data) {
-        let targets = state.withLock { s in
-            s.transports.filter { $0.key != sender }.values.map { $0 }
+    func unregister(peerID: PeerID) async {
+        transports.removeValue(forKey: peerID)
+        await publishPeerSnapshots()
+    }
+
+    func send(
+        _ data: Data,
+        from sender: PeerID,
+        to receiver: PeerID,
+        latency: Duration,
+        packetDropProbability: Double
+    ) async {
+        guard Double.random(in: 0...1) >= packetDropProbability else {
+            return
         }
-        for transport in targets {
-            transport.receive(from: sender, data: data, reliable: true)
+        guard let transport = transports[receiver] else {
+            return
+        }
+
+        if latency > .zero {
+            try? await Task.sleep(for: latency)
+        }
+        transport.receive(from: sender, data: data)
+    }
+
+    func broadcast(
+        _ data: Data,
+        from sender: PeerID,
+        latency: Duration,
+        packetDropProbability: Double
+    ) async {
+        let receivers = transports
+            .filter { $0.key != sender }
+            .map(\.value)
+
+        for transport in receivers {
+            await send(
+                data,
+                from: sender,
+                to: transport.localPeerID,
+                latency: latency,
+                packetDropProbability: packetDropProbability
+            )
         }
     }
 
-    /// 指定したピアがネットワークに参加したことを全ピアに通知する。
-    /// 参加ピアには既存の全ピアを通知し、既存ピアには参加ピアを通知する。
-    public func simulateJoin(_ peerID: PeerID) {
-        let (joiningTransport, existingTransports) = state.withLock { s -> (MockTransport?, [MockTransport]) in
-            let joining = s.transports[peerID]
-            let existing = s.transports.filter { $0.key != peerID }.values.map { $0 }
-            return (joining, Array(existing))
-        }
-
-        // 既存ピアに参加ピアを通知する
-        for transport in existingTransports {
-            transport.emitConnectionEvent(.peerJoined(peerID))
-        }
-
-        // 参加ピアに既存の全ピアを通知する
-        for transport in existingTransports {
-            joiningTransport?.emitConnectionEvent(.peerJoined(transport.localPeerID))
-        }
-    }
-
-    /// 指定したピアがネットワークから離脱したことを残りの全ピアに通知する。
-    public func simulateLeave(_ peerID: PeerID) {
-        let remainingTransports = state.withLock { s -> [MockTransport] in
-            Array(s.transports.filter { $0.key != peerID }.values)
-        }
-
-        for transport in remainingTransports {
-            transport.emitConnectionEvent(.peerLeft(peerID))
-        }
-    }
-
-    /// ネットワーク上の全PeerIDリスト。
-    public var allPeerIDs: [PeerID] {
-        state.withLock { s in Array(s.transports.keys) }
-    }
-}
-
-// MARK: - MockNetwork.MutableState
-
-extension MockNetwork {
-
-    fileprivate final class MutableState: @unchecked Sendable {
-        private let lock = NSLock()
-        var transports: [PeerID: MockTransport] = [:]
-
-        func withLock<T>(_ body: (MutableState) -> T) -> T {
-            lock.lock()
-            defer { lock.unlock() }
-            return body(self)
+    private func publishPeerSnapshots() async {
+        let allPeerIDs = Set(transports.keys)
+        for transport in transports.values {
+            var peers = allPeerIDs
+            peers.remove(transport.localPeerID)
+            transport.updatePeers(peers)
         }
     }
 }
 
-// MARK: - MockTransport
-
-/// Transport プロトコルのテスト用実装。MockNetwork を通じてメッセージを配送する。
 public final class MockTransport: Transport, @unchecked Sendable {
 
     public let localPeerID: PeerID
 
-    // MARK: Streams & Continuations
-
-    public let unreliableMessages: AsyncStream<(PeerID, Data)>
-    public let reliableMessages: AsyncStream<(PeerID, Data)>
-    public let connectionEvents: AsyncStream<ConnectionEvent>
-
-    private let unreliableContinuation: AsyncStream<(PeerID, Data)>.Continuation
-    private let reliableContinuation: AsyncStream<(PeerID, Data)>.Continuation
-    private let connectionContinuation: AsyncStream<ConnectionEvent>.Continuation
-
-    // MARK: State
-
+    private let network: MockNetwork
+    private let latency: Duration
+    private let packetDropProbability: Double
     private let lock = NSLock()
-    private var _connectedPeers: Set<PeerID> = []
-    private weak var _network: MockNetwork?
 
-    public var connectedPeers: [PeerID] {
-        lock.withLock { Array(_connectedPeers) }
-    }
+    public let peers: AsyncStream<Set<PeerID>>
+    public let incomingMessages: AsyncStream<(PeerID, Data)>
 
-    // MARK: Init
+    private let peersContinuation: AsyncStream<Set<PeerID>>.Continuation
+    private let incomingMessagesContinuation: AsyncStream<(PeerID, Data)>.Continuation
+    private var isStarted = false
 
-    init(localPeerID: PeerID, network: MockNetwork) {
+    public init(
+        localPeerID: PeerID,
+        network: MockNetwork,
+        latency: Duration = .zero,
+        packetDropProbability: Double = 0
+    ) {
         self.localPeerID = localPeerID
+        self.network = network
+        self.latency = latency
+        self.packetDropProbability = packetDropProbability
 
-        var unreliableCont: AsyncStream<(PeerID, Data)>.Continuation!
-        var reliableCont: AsyncStream<(PeerID, Data)>.Continuation!
-        var connectionCont: AsyncStream<ConnectionEvent>.Continuation!
+        var peersContinuation: AsyncStream<Set<PeerID>>.Continuation!
+        self.peers = AsyncStream { peersContinuation = $0 }
+        self.peersContinuation = peersContinuation
 
-        unreliableMessages = AsyncStream { unreliableCont = $0 }
-        reliableMessages = AsyncStream { reliableCont = $0 }
-        connectionEvents = AsyncStream { connectionCont = $0 }
-
-        unreliableContinuation = unreliableCont
-        reliableContinuation = reliableCont
-        connectionContinuation = connectionCont
-
-        _network = network
+        var incomingMessagesContinuation: AsyncStream<(PeerID, Data)>.Continuation!
+        self.incomingMessages = AsyncStream { incomingMessagesContinuation = $0 }
+        self.incomingMessagesContinuation = incomingMessagesContinuation
     }
 
-    // MARK: Transport lifecycle
-
-    public func start() throws {}
-    public func stop() {}
-
-    // MARK: Internal
-
-    /// 受信メッセージを適切なストリームに流す。
-    func receive(from sender: PeerID, data: Data, reliable: Bool) {
-        if reliable {
-            reliableContinuation.yield((sender, data))
-        } else {
-            unreliableContinuation.yield((sender, data))
+    public func start() async throws {
+        let shouldStart = lock.withLock { () -> Bool in
+            guard !isStarted else { return false }
+            isStarted = true
+            return true
         }
+        guard shouldStart else { return }
+        await network.register(self)
     }
 
-    /// 接続イベントを発行し、connectedPeers セットを更新する。
-    func emitConnectionEvent(_ event: ConnectionEvent) {
-        lock.withLock {
-            switch event {
-            case .peerJoined(let peerID):
-                _connectedPeers.insert(peerID)
-            case .peerLeft(let peerID):
-                _connectedPeers.remove(peerID)
-            case .transportDegraded, .transportRestored:
-                break
-            }
+    public func stop() async {
+        let shouldStop = lock.withLock { () -> Bool in
+            guard isStarted else { return false }
+            isStarted = false
+            return true
         }
-        connectionContinuation.yield(event)
+        guard shouldStop else { return }
+
+        await network.unregister(peerID: localPeerID)
+        peersContinuation.finish()
+        incomingMessagesContinuation.finish()
     }
 
-    // MARK: Transport
-
-    public func sendUnreliable(_ data: Data, to peer: PeerID) async throws {
-        let network = lock.withLock { _network }
-        network?.deliver(from: localPeerID, to: peer, data: data, reliable: false)
+    public func send(_ data: Data, to peer: PeerID) async throws {
+        await network.send(
+            data,
+            from: localPeerID,
+            to: peer,
+            latency: latency,
+            packetDropProbability: packetDropProbability
+        )
     }
 
-    public func sendReliable(_ data: Data, to peer: PeerID) async throws {
-        let network = lock.withLock { _network }
-        network?.deliver(from: localPeerID, to: peer, data: data, reliable: true)
+    public func broadcast(_ data: Data) async throws {
+        await network.broadcast(
+            data,
+            from: localPeerID,
+            latency: latency,
+            packetDropProbability: packetDropProbability
+        )
     }
 
-    public func broadcastReliable(_ data: Data) async throws {
-        let network = lock.withLock { _network }
-        network?.broadcastReliable(from: localPeerID, data: data)
+    fileprivate func updatePeers(_ peers: Set<PeerID>) {
+        peersContinuation.yield(peers)
+    }
+
+    fileprivate func receive(from sender: PeerID, data: Data) {
+        incomingMessagesContinuation.yield((sender, data))
     }
 }

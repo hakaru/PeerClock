@@ -1,35 +1,9 @@
 import Foundation
 
-// MARK: - PeerID
-
-/// A unique identifier for a peer device on the network.
-public struct PeerID: Hashable, Sendable, Comparable, CustomStringConvertible {
-
-    /// The underlying UUID value.
-    public let rawValue: UUID
-
-    public init(_ uuid: UUID) {
-        self.rawValue = uuid
-    }
-
-    public init(rawValue: UUID) {
-        self.rawValue = rawValue
-    }
-
-    public static func < (lhs: PeerID, rhs: PeerID) -> Bool {
-        lhs.rawValue.uuidString < rhs.rawValue.uuidString
-    }
-
-    /// First 8 characters of the UUID string in lowercase.
-    public var description: String {
-        String(rawValue.uuidString.lowercased().prefix(8))
-    }
-}
-
 // MARK: - Command
 
 /// An application-level command sent between peers.
-public struct Command: Sendable {
+public struct Command: Sendable, Equatable {
 
     /// Command type identifier.
     public let type: String
@@ -161,47 +135,4 @@ public struct Peer: Sendable, Identifiable {
         self.name = name
         self.status = status
     }
-}
-
-// MARK: - Configuration
-
-/// Runtime configuration for a PeerClock instance.
-public struct Configuration: Sendable {
-
-    /// Interval in seconds between heartbeat packets.
-    public let heartbeatInterval: TimeInterval
-
-    /// Number of missed heartbeats before a peer is considered disconnected.
-    public let disconnectThreshold: Int
-
-    /// Interval in seconds between sync rounds.
-    public let syncInterval: TimeInterval
-
-    /// Number of timing measurements per sync round.
-    public let syncMeasurements: Int
-
-    /// Interval in seconds between individual measurements within a sync round.
-    public let syncMeasurementInterval: TimeInterval
-
-    /// Bonjour service type string.
-    public let serviceName: String
-
-    public init(
-        heartbeatInterval: TimeInterval = 1.0,
-        disconnectThreshold: Int = 3,
-        syncInterval: TimeInterval = 5.0,
-        syncMeasurements: Int = 40,
-        syncMeasurementInterval: TimeInterval = 0.03,
-        serviceName: String = "_peerclock._tcp"
-    ) {
-        self.heartbeatInterval = heartbeatInterval
-        self.disconnectThreshold = disconnectThreshold
-        self.syncInterval = syncInterval
-        self.syncMeasurements = syncMeasurements
-        self.syncMeasurementInterval = syncMeasurementInterval
-        self.serviceName = serviceName
-    }
-
-    /// Default configuration with sensible values.
-    public static let `default` = Configuration()
 }
