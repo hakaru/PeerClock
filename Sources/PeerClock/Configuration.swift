@@ -37,6 +37,13 @@ public struct Configuration: Sendable {
     /// Interval in seconds between sync rounds.
     public let syncInterval: TimeInterval
 
+    /// Backoff stages (秒)。同期成功が連続するとこの順で sync interval が延長される。
+    /// 既存の `syncInterval` は deprecated 扱い (NTPSyncEngine 内部では未使用)。
+    public let syncBackoffStages: [TimeInterval]
+
+    /// 各段階で次の段階へ昇格するために必要な連続成功回数。
+    public let syncBackoffPromoteAfter: Int
+
     /// Number of timing measurements per sync round.
     public let syncMeasurements: Int
 
@@ -66,6 +73,8 @@ public struct Configuration: Sendable {
         statusSendDebounce: TimeInterval = 0.1,
         statusReceiveDebounce: TimeInterval = 0.05,
         syncInterval: TimeInterval = 5.0,
+        syncBackoffStages: [TimeInterval] = [5.0, 10.0, 20.0, 30.0],
+        syncBackoffPromoteAfter: Int = 3,
         syncMeasurements: Int = 40,
         syncMeasurementInterval: TimeInterval = 0.03,
         mcServiceType: String = "peerclock-mpc",
@@ -81,6 +90,8 @@ public struct Configuration: Sendable {
         self.statusSendDebounce = statusSendDebounce
         self.statusReceiveDebounce = statusReceiveDebounce
         self.syncInterval = syncInterval
+        self.syncBackoffStages = syncBackoffStages
+        self.syncBackoffPromoteAfter = syncBackoffPromoteAfter
         self.syncMeasurements = syncMeasurements
         self.syncMeasurementInterval = syncMeasurementInterval
         self.mcServiceType = mcServiceType
