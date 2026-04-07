@@ -493,7 +493,13 @@ extension PeerClock {
     /// - 過去時刻は即発火 (state == .missed)
     /// - stop() 時には保留中イベントは全て .cancelled になる
     /// - precision target: ±5ms (1Take の同時録音想定で吸収可能なレンジ)
-    /// - フォアグラウンド前提。バックグラウンドでの精度は保証しない
+    /// - **フォアグラウンド前提**。バックグラウンドでの精度は保証しない。
+    ///   AVAudioSession 起動中または Background Modes (Audio) 有効時のみ
+    ///   `Task.sleep` が継続する。
+    /// - **オーディオ用途のアドバイス**: AVAudioEngine 起動には数十 ms 以上
+    ///   かかるため、`schedule` で叩く action は「録音開始そのもの」ではなく
+    ///   「プリロール完了後のフラグ反転」「書き込み有効化」「サンプルカウント
+    ///   同期」など、軽量で即実行可能な処理にすることを推奨する。
     public func schedule(
         atSyncedTime: UInt64,
         _ action: @Sendable @escaping () -> Void
@@ -508,6 +514,10 @@ public struct ScheduledEventHandle: Sendable, Hashable {
     public func cancel() async
     public func state() async -> ScheduledEventState
 }
+// 注: ScheduledEventHandle は UUID + 内部の弱参照ラッパとして実装する。
+// EventScheduler 実体は PeerClock 側が強参照し、ハンドルは UUID と
+// scheduler への弱参照のみを持つ。これにより循環参照を回避する。
+// cancel/state は内部で `await scheduler?.cancel(id)` / `state(id)` を呼ぶ形。
 
 public enum ScheduledEventState: Sendable {
     case pending     // 待機中
@@ -521,7 +531,10 @@ public enum ScheduledEventState: Sendable {
 
 public enum SchedulerEvent: Sendable {
     /// クロックジャンプ検知。eventID が予約中で、新オフセットで発火時刻が
-    /// 当初予定より大きくずれる可能性がある (再照準はしない)
+    /// 当初予定より大きくずれる可能性がある (再照準はしない)。
+    /// 用途: アプリは事後に「このイベントは旧タイムラインで発火したため、
+    /// 記録タイムスタンプを (newOffsetNs - oldOffsetNs) 分補正する」など
+    /// の事後処理ができる。
     case driftWarning(eventID: UUID, oldOffsetNs: Int64, newOffsetNs: Int64)
 }
 ```
@@ -542,7 +555,11 @@ public enum SchedulerEvent: Sendable {
 // pseudo-code
 private func tryFire(_ id: UUID) {
     guard var event = events[id], event.state == .pending else { return }
-    event.state = .missed が deadline 過ぎていれば .missed、そうでなければ .fired
+    // 起床後の現在時刻と当初予定を比較。OS スリープ復帰遅延などで
+    // tolerance (例: 10ms) を超えていたら .missed として記録する
+    // (action は実行する。.missed は「実用上遅刻」の情報フラグ)。
+    let lateness = Int64(now()) - Int64(event.atSyncedTime)
+    event.state = (lateness > toleranceNs) ? .missed : .fired
     events[id] = event
     let action = event.action
     Task.detached { action() }
