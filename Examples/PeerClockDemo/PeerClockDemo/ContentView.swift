@@ -12,6 +12,7 @@ struct ContentView: View {
                     syncStatusSection
                     peersSection
                     commandsSection
+                    scheduledEventSection
                     logSection
                 }
                 .padding()
@@ -185,6 +186,33 @@ struct ContentView: View {
                     }
                 }
             }
+        }
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var scheduledEventSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Scheduled Events")
+                .font(.headline)
+            HStack {
+                Button("Schedule +3s") {
+                    Task { await viewModel.scheduleBeepIn3Seconds() }
+                }
+                .buttonStyle(.bordered)
+                .disabled(!isRunning)
+
+                Button("Cancel") {
+                    Task { await viewModel.cancelScheduledBeep() }
+                }
+                .buttonStyle(.bordered)
+                .disabled(!isRunning)
+            }
+            Text(viewModel.lastScheduledFireLog)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         .padding()
         .frame(maxWidth: .infinity, alignment: .leading)

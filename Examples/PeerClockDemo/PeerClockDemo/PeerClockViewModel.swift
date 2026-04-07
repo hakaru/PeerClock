@@ -41,6 +41,7 @@ final class PeerClockViewModel {
 
     private(set) var runState: RunState = .stopped
     private(set) var localPeerID: String = "-"
+    private(set) var lastScheduledFireLog: String = "-"
     private(set) var coordinatorLabel: String = "none"
     private(set) var isLocalCoordinator: Bool = false
     private(set) var syncStateLabel: String = "idle"
@@ -55,6 +56,7 @@ final class PeerClockViewModel {
     // MARK: - Private
 
     private var clock: PeerClock?
+    private var scheduleHandle: ScheduledEventHandle?
     private var syncStateTask: Task<Void, Never>?
     private var peersTask: Task<Void, Never>?
     private var commandsTask: Task<Void, Never>?
@@ -136,6 +138,9 @@ final class PeerClockViewModel {
         coordinatorPollTask?.cancel()
         statusTask?.cancel()
         connectionTask?.cancel()
+        await scheduleHandle?.cancel()
+        scheduleHandle = nil
+        lastScheduledFireLog = "-"
         await clock?.stop()
         clock = nil
         runState = .stopped
@@ -168,6 +173,26 @@ final class PeerClockViewModel {
         } catch {
             appendLog("ERROR: broadcast failed: \(error.localizedDescription)")
         }
+    }
+
+    func scheduleBeepIn3Seconds() async {
+        guard let clock else { return }
+        let target = clock.now + 3_000_000_000
+        appendLog("Scheduling fire at +3s (synced)")
+        let handle = await clock.schedule(atSyncedTime: target) { [weak self] in
+            Task { @MainActor in
+                let stamp = ISO8601DateFormatter().string(from: Date())
+                self?.lastScheduledFireLog = "🔔 fired at \(stamp)"
+                self?.appendLog("🔔 Scheduled event fired")
+            }
+        }
+        scheduleHandle = handle
+    }
+
+    func cancelScheduledBeep() async {
+        await scheduleHandle?.cancel()
+        scheduleHandle = nil
+        appendLog("Cancelled scheduled event")
     }
 
     // MARK: - Handlers
