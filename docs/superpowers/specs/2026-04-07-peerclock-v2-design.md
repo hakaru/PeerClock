@@ -628,6 +628,9 @@ public func cancel(_ id: UUID) {
 - `WiFiTransport` が `NWConnection.stateUpdateHandler` で `.failed` / `.cancelled` を即検知
 - `reconnectRetryInterval` (既定 500ms) × `reconnectMaxAttempts` (既定 3) = 最大 1.5s のリトライウィンドウ
 - **旧 connection は `cancel()` で完全破棄**し新 connection のみ利用 (並存しない)
+- **受信側の Last-In-Win**: Listener が同一 PeerID から新しい inbound connection を受け取った場合、既存の connection を即座に `cancel()` して新しいものに差し替える。これにより dialer 側が旧を破棄しても listener 側に half-open が残る問題を回避する
+- **再接続時のハンドシェイク**: 新 connection 確立後、既存と同じ 16-byte PeerID 生送信ハンドシェイクを再実行する。`Message.hello` は現状未使用の残骸で Phase 3a では触らない
+- **In-flight メッセージ**: リトライ中の送信要求はエラーを返す (バッファリングしない)。Command は欠落しうる — アプリ側が idempotency を担保する前提。Status は再接続後の `flushNow()` で自動救済される
 - リトライ成功時は `peers` ストリームに変化を流さない (同じ PeerID のまま透過復帰)
 - リトライ失敗時は `peers` から削除して disconnect イベントを上位へ
 
@@ -636,25 +639,31 @@ public func cancel(_ id: UUID) {
 - `Discovery` の Bonjour browser は **常時継続中** なので、ピアが再 advertise すれば `peers` ストリームに自動再登場
 - 永久に失われる扱いはしない。タイムアウトなし
 - バックストップ: Transport 層がキャッチしそこねた TCP half-open ケースを HeartbeatMonitor がカバー
+- **2 層の race 許容**: Transport 層の 1.5s retry 中に heartbeat の 2s degraded / 5s disconnected が進むことは許容する。retry 成功なら HEARTBEAT 受信で自然に `connected` に戻り、retry 失敗ならそのまま disconnected で正しい状態になる。特別な抑止ロジックは不要
 
 **Coordinator 再選出**
 - 既存の `CoordinatorElection.updatePeers()` + `runCoordinationLoop` が peer リスト変更を検知して `coordinatorUpdates` に流す仕組みは Phase 1 で実装済み
-- Phase 3a では再選出パスを**精査 + テスト追加**し、以下を保証:
-  - 旧 coordinator が `.disconnected` になった時、新 coordinator 選出が走る
+- **問題点**: 現実装は `transport.peers` の変化だけを起点に再選出する。Phase 2a で追加した `HeartbeatMonitor` の `.disconnected` イベントは election に入っていない。TCP half-open で transport 層が peer を残したまま heartbeat だけが死んだ場合、再選出が走らない
+- **Phase 3a の修正**: `runCoordinationLoop` を拡張し、`HeartbeatMonitor.events` の `.disconnected` イベントも `CoordinatorElection.updatePeers()` の入力として使う。具体的には transport.peers と heartbeat state の両方を反映した「effective peer set」を計算して election に渡す
+- 再選出パスを**精査 + テスト追加**し、以下を保証:
+  - 旧 coordinator が `.disconnected` になった時、新 coordinator 選出が走る (transport.peers 経由でも heartbeat 経由でも)
   - 新 coordinator が自分の場合、`syncEngine.stop()` → `startSyncResponder` に切替
   - 新 coordinator が他 peer の場合、`syncEngine.start(coordinator: newID)` で再同期開始
   - 過渡状態で古い `syncResponderTask` が残らないよう cancel 徹底
+- **NTPSyncEngine のステートリセット**: `syncEngine.start(coordinator:)` を呼ぶ時、内部の統計バッファ (RTT 履歴・直前 offset・drift 推定) を**必ず完全リセット**する。これにより follower → coordinator、または異なる coordinator 相手への切替時に古いデータが混入しない。現実装の `stop()` は task を止めるだけなので、Phase 3a でリセットロジックを追加する必要あり
 
 **再接続後のフル同期**
 
 再接続は「ピアの新規参加」として既存 join フローを流用する。peer が再出現した時点で自動的に:
 
 1. `CoordinatorElection.updatePeers()` で coordinator 再計算
-2. 新 coordinator 相手に `NTPSyncEngine.start(coordinator:)` で clock sync 再開
+2. 新 coordinator 相手に `NTPSyncEngine.start(coordinator:)` で clock sync 再開 (内部統計はリセット済み)
 3. **`StatusRegistry.flushNow()` を呼んで** ローカル全ステータスを STATUS_PUSH (Phase 3a で追加する配線)
 4. `HeartbeatMonitor.peerJoined(id)` で自動的に `connected` 状態に戻る
 
 「新規参加」と「再接続」の区別は不要。追加実装は `StatusRegistry.flushNow()` 呼び出しのみ。
+
+**flushNow() の呼び出し位置 (N 重複防止)**: `runCoordinationLoop` 内で `for p in added { ... }` の**外**で、`if !added.isEmpty { await statusRegistry.flushNow() }` として 1 回だけ呼ぶ。`flushNow()` は全 peer 向け broadcast なので 1 回で十分で、N 件の join があっても N 回呼んではいけない。必要なら 0-100ms のランダムジッターを挟んでトラフィック集中を避ける
 
 **Configuration 追加項目**
 ```swift
