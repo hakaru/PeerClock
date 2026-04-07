@@ -6,9 +6,25 @@ struct ContentView: View {
     @State private var viewModel = PeerClockViewModel()
 
     var body: some View {
+        @Bindable var viewModel = viewModel
+
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    HStack {
+                        Text("Transport")
+                            .font(.headline)
+                        Spacer()
+                        Picker("", selection: $viewModel.useMultipeerConnectivity) {
+                            Text("WiFi").tag(false)
+                            Text("MC").tag(true)
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 140)
+                        .disabled(!viewModel.isStopped)
+                    }
+                    .padding(.horizontal)
+
                     syncStatusSection
                     peersSection
                     commandsSection
