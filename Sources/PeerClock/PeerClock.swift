@@ -429,12 +429,11 @@ public final class PeerClock: @unchecked Sendable {
 
             // コーディネーター選出を更新
             // Phase 3a: exclude heartbeat-disconnected peers from election
-            let hb = lock.withLock { heartbeatMonitor }
             var effectivePeers: [PeerID] = []
             if let hb {
                 for p in newPeerList {
                     let state = await hb.currentState(of: p)
-                    if state != .disconnected {
+                    if state != ConnectionState.disconnected {
                         effectivePeers.append(p)
                     }
                 }
@@ -485,7 +484,7 @@ public final class PeerClock: @unchecked Sendable {
         if let hb {
             for p in peers {
                 let state = await hb.currentState(of: p)
-                if state != .disconnected {
+                if state != ConnectionState.disconnected {
                     effective.append(p)
                 }
             }
