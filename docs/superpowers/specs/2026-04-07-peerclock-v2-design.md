@@ -683,10 +683,98 @@ public func simulateReconnect(peer: PeerID)
 
 #### Phase 3b: MultipeerConnectivity トランスポート
 
-- `MultipeerTransport: Transport` 実装
-- reliable / unreliable / unicast / broadcast の全経路を MCSession でサポート
-- 既存 `Transport` プロトコルに準拠、facade は差し替え可能
-- iOS/macOS 共通 API
+新 Transport 実装のみをスコープとする。自動切替は Phase 3c 。
+
+**構成**
+- `Sources/PeerClock/Transport/MultipeerTransport.swift` — 本体
+- `Sources/PeerClock/Transport/MultipeerIdentity.swift` — 純関数ヘルパ
+- `Tests/PeerClockTests/MultipeerIdentityTests.swift` — ヘルパのユニットテスト
+
+**主要設計判断**
+
+1. **Identity マッピング**: `MCPeerID.displayName` に PeerID (UUID 文字列, 36 char) を埋め込む。受信側は `UUID(uuidString:)` で復元。ハンドシェイク不要で発見と identity 確定が同時。
+
+2. **招待方向の一意化**: 二重招待 race を避けるため、**小さい PeerID 側のみ** `invitePeer` を呼ぶ。大きい PeerID 側は `didReceiveInvitation` で受諾のみ。
+
+3. **Invitation context marker**: `invitePeer` の context に `Data("peerclock-v1".utf8)` を入れ、`didReceiveInvitation` で照合。異種アプリが同じ serviceType を使った場合の誤接続を防ぐ二重チェック。
+
+4. **Encryption**: `MCSession` の `encryptionPreference: .optional` — 両端対応なら暗号化、非対応でも接続可。spec の「ローカルネット前提・v1 は暗号化なし」と矛盾しない (best-effort)。
+
+5. **Reliable / Unreliable**: `Transport.send` / `broadcast` → `.reliable`、`broadcastUnreliable` → `.unreliable` に直接マッピング。HEARTBEAT が MPC でも unreliable で送れる。
+
+6. **切断検知**: `MCSession` が内部で接続管理・リトライを既に持っている。`.notConnected` は確定的切断とみなし、即 `peers` から削除。追加リトライはしない。Phase 3a の上位層 (runCoordinationLoop + heartbeat) と browser 継続稼働により、peer が再出現すれば自動再招待される。
+
+**MultipeerIdentity (純関数ヘルパ)**
+
+```swift
+enum MultipeerIdentity {
+    static let invitationContextMarker = Data("peerclock-v1".utf8)
+
+    static func encode(_ peerID: PeerID) -> String {
+        peerID.rawValue.uuidString
+    }
+
+    static func decode(_ displayName: String) -> PeerID? {
+        UUID(uuidString: displayName).map { PeerID(rawValue: $0) }
+    }
+
+    static func shouldInitiateInvitation(local: PeerID, remote: PeerID) -> Bool {
+        local < remote
+    }
+
+    static func verifyInvitation(context: Data?) -> Bool {
+        context == invitationContextMarker
+    }
+}
+```
+
+**MultipeerTransport 構造**
+
+```swift
+public final class MultipeerTransport: Transport, @unchecked Sendable {
+    public let localPeerID: PeerID
+    private let mcPeerID: MCPeerID
+    private let session: MCSession
+    private let advertiser: MCNearbyServiceAdvertiser
+    private let browser: MCNearbyServiceBrowser
+
+    // Bidirectional MCPeerID ↔ PeerClock.PeerID maps
+    private var pcToMC: [PeerID: MCPeerID] = [:]
+    private var mcToPC: [MCPeerID: PeerID] = [:]
+
+    public let peers: AsyncStream<Set<PeerID>>
+    public let incomingMessages: AsyncStream<(PeerID, Data)>
+
+    public init(localPeerID: PeerID, configuration: Configuration)
+    public func start() async throws
+    public func stop() async
+    public func send(_ data: Data, to peer: PeerID) async throws  // .reliable
+    public func broadcast(_ data: Data) async throws              // .reliable
+    public func broadcastUnreliable(_ data: Data) async throws    // .unreliable
+}
+```
+
+**Configuration 追加項目**
+
+```swift
+/// MultipeerConnectivity service type (1-15 chars, ASCII 英数字/ハイフンのみ)
+public var mcServiceType: String = "peerclock-mpc"
+```
+
+**Facade 統合方針**
+
+`PeerClock` facade には手を入れない。アプリが `transportFactory` に `{ MultipeerTransport(localPeerID: $0, configuration: config) }` を渡せば MPC 経路で動く opt-in 方式。demo app に MC モード切替トグルを追加して実機検証する。
+
+**テスト戦略**
+
+- **ユニット** (`MultipeerIdentityTests`): `encode`/`decode` ラウンドトリップ、不正文字列で nil、`shouldInitiateInvitation`、`verifyInvitation` の正常/不正ケース
+- **実機**: iOS 2 台で **WiFi OFF** の状態でアプリ起動 → Bluetooth 経由 MPC で発見・接続 → clock sync + status + heartbeat が動作することを確認
+
+**Phase 1-3a との関係**
+
+- Transport protocol 準拠なので既存の上位層 (PeerClock, CoordinatorElection, NTPSyncEngine, CommandRouter, StatusRegistry, HeartbeatMonitor, EventScheduler) はそのまま動く
+- Phase 3a の再接続・再選出ロジックは Transport 実装非依存なので MPC でも即座に効く
+- WiFiTransport は変更なし、共存
 
 #### Phase 3c: 自動トランスポート切替
 
