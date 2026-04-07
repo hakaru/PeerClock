@@ -511,10 +511,13 @@ public struct ScheduledEventHandle: Sendable, Hashable {
 
 public enum ScheduledEventState: Sendable {
     case pending     // 待機中
-    case fired       // 発火済み
-    case cancelled   // キャンセル済み
-    case missed      // 過去時刻指定で即発火扱い
+    case fired       // 予定通り発火 (action 実行済み)
+    case cancelled   // キャンセル済み (action は実行されていない)
+    case missed      // 過去時刻のため即発火扱い (action は実行された、遅刻 fire)
 }
+// 注: .missed と .fired はどちらも action が実行されたことを示す。
+// .missed は「期限切れ即発火」を区別するための情報。action が実行されなかった
+// 唯一のターミナル状態は .cancelled。
 
 public enum SchedulerEvent: Sendable {
     /// クロックジャンプ検知。eventID が予約中で、新オフセットで発火時刻が
@@ -523,30 +526,77 @@ public enum SchedulerEvent: Sendable {
 }
 ```
 
+#### Time base
+**統一**: spec 内で `atSyncedTime` は **常に `clock.now` と同じ time base** (`mach_continuous_time` ナノ秒 + sync offset)。`mach_absolute_time` は使わない (古い記述があれば誤記)。
+
 #### 内部設計
 - `EventScheduler` は **actor**。`[UUID: ScheduledEvent]` でイベントを管理
-- **1 イベント = 1 Task**: `Task { try? await Task.sleep(nanoseconds: delay); detached fire }` の構造
-- **action は detached Task で実行**: scheduler actor をブロックしない。アプリは action 内で `Task { @MainActor in ... }` と書けば UI 更新可
-- **時刻計算**: `delay = Int64(atSyncedTime) - Int64(clock.now)`、負なら即発火・state を `.missed`
-- **ジャンプ通知**: `DriftMonitor` の jump イベントを購読、保留中イベントに対して `schedulerEvents` に `.driftWarning` を yield + `os_log` に warning ログを出力（再照準はしない）
-- **stop**: 全 Task キャンセル、全ハンドル state を `.cancelled` に、`schedulerEvents` continuation finish
+- **1 イベント = 1 Task**: `Task { try? await sleeper.sleep(nanoseconds: delay); await self.tryFire(id) }` の構造。`tryFire` は actor 内メソッドで、guard で state チェックしてから detached fire
+- **時刻計算**: `delay = Int64(atSyncedTime) - Int64(now())`、負なら即発火・state を `.missed`
+
+#### Cancel / Fire の race 回避
+
+`tryFire` を **actor 内 atomic** にする:
+
+```swift
+// pseudo-code
+private func tryFire(_ id: UUID) {
+    guard var event = events[id], event.state == .pending else { return }
+    event.state = .missed が deadline 過ぎていれば .missed、そうでなければ .fired
+    events[id] = event
+    let action = event.action
+    Task.detached { action() }
+}
+
+public func cancel(_ id: UUID) {
+    guard var event = events[id], event.state == .pending else { return }
+    event.state = .cancelled
+    events[id] = event
+    event.task?.cancel()  // sleeper を起こす
+}
+```
+
+**保証**: actor isolation により、`tryFire` と `cancel` は逐次化される。先に `cancel` が走れば state が `.cancelled` になり、後続の `tryFire` の guard で弾かれる。逆も同じ。`detached` で起動した action は actor 外で動くが、起動の決定自体が actor 内で atomic なので「action 実行された後で state == .cancelled」は発生しない。
+
+#### DriftMonitor 連携
+
+**現状の問題**: 既存 `DriftMonitor.recordOffset()` は `.jumpDetected` を戻り値で返すだけで購読 API なし。`PeerClock` も結果を捨てている。
+
+**Phase 2b で追加**:
+1. `DriftMonitor` に `var jumps: AsyncStream<JumpEvent>` を追加 (`recordOffset` 内で yield)
+2. `JumpEvent` 型: `oldOffsetNs: Int64`, `newOffsetNs: Int64`
+3. `PeerClock.start()` で `DriftMonitor.jumps` を `EventScheduler` に橋渡し
+4. `EventScheduler` は jump 受信時、保留中イベントごとに `schedulerEvents` に `.driftWarning` を yield + `os_log` に warning ログ
+
+#### stop と再起動
+- **stop**: 全 Task キャンセル、全ハンドル state を `.cancelled` に
+- **schedulerEvents continuation**: 既存 facade の `peers` / `syncState` ストリームに合わせ、**init 時に固定保持し stop でも finish しない**。再 start 時にそのまま再利用可
 
 #### 待機実装
-- `Task.sleep(nanoseconds:)` ベース。Swift 6 のキャンセル統合と相性が良い
-- 将来精度要求が上がれば「coarse sleep + 短い mach_wait_until」の二段階化に差し替え可能
+- **`Sleeper` プロトコルで sleep を抽象化** (`func sleep(nanoseconds: UInt64) async throws`)
+- 本番実装 `RealSleeper`: `Task.sleep(nanoseconds:)` を呼ぶだけ
+- テスト実装 `MockSleeper`: イベントを enqueue して、テスト側から `advance(by:)` で進める (HeartbeatMonitor の VirtualClock と同じ思想を sleep に拡張したもの)
+- 将来精度要求が上がれば `RealSleeper` を「coarse sleep + 短い mach_wait_until」の二段階に差し替え可能
 
 #### Wire Protocol
 - 追加なし。EventScheduler はローカル動作のみ。同期時刻の peer 間共有が必要な場合はアプリが既存の `Command` チャネルで時刻値を送る
 
 #### テスト戦略
-- **ユニット (仮想時計)**: `now: () -> UInt64` を注入する HeartbeatMonitor 方式
-  - 順序: 複数イベントが指定時刻順に発火
-  - cancel: 待機中ハンドルを cancel すると action が呼ばれない
-  - state 遷移: pending → fired / cancelled / missed
-  - 期限切れ: 過去時刻指定で即発火、state == .missed
-  - ジャンプ通知: DriftMonitor のジャンプを擬似注入 → schedulerEvents に `.driftWarning` が届く
-  - stop: 保留イベント全て cancelled
-- **統合 (MockNetwork)**: 2台が同じ synced time に schedule → 両端でほぼ同時に action 実行
+
+**EventScheduler は `now: () -> UInt64` と `Sleeper` を両方注入する。** これによりユニットテストは仮想時計で完全制御可能になる。
+
+- **ユニット (MockSleeper + 仮想 now)**: 実時間を消費しない決定論的テスト
+  - 順序: 異なる時刻でスケジュールした複数イベントが指定順で発火
+  - cancel: 待機中ハンドルを cancel → MockSleeper を進めても action は呼ばれない
+  - state 遷移: pending → fired / cancelled / missed (各遷移を仮想時刻で観測)
+  - 期限切れ: schedule 時点で過去時刻 → state == .missed、action 即実行
+  - ジャンプ通知: 注入した DriftMonitor から jump イベント注入 → schedulerEvents に `.driftWarning` が届く
+  - stop: 保留イベント全て .cancelled、対応する Task もキャンセル
+  - cancel/fire race: 同時に cancel と sleeper 完了を起こしても、actor isolation により action が二重実行や cancelled-but-fired にならない
+- **統合 (RealSleeper, 短い実時間)**: ms オーダーの実時間で actor + Task.sleep + facade 統合の挙動を検証
+  - facade 経由で `clock.schedule(at: clock.now + 100_000_000) { ... }` → 100ms 後に action 実行
+  - cancel が実時間でも効く
+- **MockNetwork での 2 台統合**: 両 PeerClock が同じ synced time に schedule → ほぼ同時に action 実行 (clock 同期誤差 + scheduler ジッタの合算)
 - **実機**: Demo app に「3秒後にビープ」ボタンを追加し、両端の発火タイミングを目視/ログで確認
 
 ### Phase 3: レジリエンス
