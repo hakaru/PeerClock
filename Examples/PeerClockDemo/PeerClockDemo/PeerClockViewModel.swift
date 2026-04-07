@@ -39,6 +39,12 @@ final class PeerClockViewModel {
         let statusSummary: String
     }
 
+    enum TransportMode: String, CaseIterable, Sendable {
+        case wifi = "WiFi"
+        case mc = "MC"
+        case auto = "Auto"
+    }
+
     private(set) var runState: RunState = .stopped
     private(set) var localPeerID: String = "-"
     private(set) var lastScheduledFireLog: String = "-"
@@ -52,7 +58,7 @@ final class PeerClockViewModel {
     private(set) var remotePeers: [RemotePeerView] = []
     private(set) var logs: [LogEntry] = []
     private(set) var commandLog: [CommandLogEntry] = []
-    var useMultipeerConnectivity: Bool = false
+    var transportMode: TransportMode = .wifi
 
     // MARK: - Private
 
@@ -72,14 +78,27 @@ final class PeerClockViewModel {
         runState = .starting
 
         let clock: PeerClock
-        if useMultipeerConnectivity {
+        switch transportMode {
+        case .wifi:
+            clock = PeerClock()
+            appendLog("Using WiFiTransport (default)")
+        case .mc:
             clock = PeerClock(transportFactory: { peerID in
                 MultipeerTransport(localPeerID: peerID, configuration: .default)
             })
             appendLog("Using MultipeerTransport (MC)")
-        } else {
-            clock = PeerClock()
-            appendLog("Using WiFiTransport (default)")
+        case .auto:
+            clock = PeerClock(transportFactory: { peerID in
+                FailoverTransport(options: [
+                    .init(label: "WiFi") {
+                        WiFiTransport(localPeerID: peerID, configuration: .default)
+                    },
+                    .init(label: "MC") {
+                        MultipeerTransport(localPeerID: peerID, configuration: .default)
+                    }
+                ])
+            })
+            appendLog("Using FailoverTransport (Auto)")
         }
         self.clock = clock
         self.localPeerID = "\(clock.localPeerID)"
@@ -161,6 +180,10 @@ final class PeerClockViewModel {
     var isStopped: Bool {
         if case .stopped = runState { return true }
         return false
+    }
+
+    var activeTransportLabel: String? {
+        clock?.activeTransportLabel
     }
 
     // MARK: - Broadcast

@@ -820,10 +820,155 @@ public var mcMaxPeers: Int = 8
 
 #### Phase 3c: 自動トランスポート切替
 
-- WiFi → MC フォールバック (ネットワーク非対応環境で MC 有効化)
-- トランスポート品質モニタリング (packet loss, RTT)
-- 切替判断ロジック
-- 切替時のステート引き継ぎ
+Failover モデル (1 度に 1 Transport、起動時のみ試行、runtime 切替なし) で WiFi → MC フォールバックを実現する。`Transport` protocol を満たすラッパ `FailoverTransport` として実装し、上位層は変更なし。
+
+**スコープ**
+- `FailoverTransport` ラッパ (label + factory のペアを受け取る)
+- PeerClock facade に `activeTransportLabel: String?` を公開
+- Demo app に Auto モードを追加
+
+**スコープ外** (将来 Phase)
+- Runtime トランスポート監視 (NWPathMonitor)
+- 並行マルチトランスポート
+- 品質ベース選択 (packet loss, RTT)
+- バックグラウンド対応 (Phase 3d)
+
+**Failover アルゴリズム**
+
+1. `options` を順番にループ
+2. 各 option について `factory()` で Transport を生成し、`try await transport.start()` を呼ぶ
+3. 成功 → `active = (label, transport)` をセット、ストリーム forward を起動、return
+4. 失敗 → **部分的に初期化された Transport は `await transport.stop()` で明示的にクリーンアップ**した後、エラーを `underlying` 配列に追加して次の option へ
+5. 全 option が失敗 → `throw FailoverTransportError.allOptionsFailed(underlying: errors)` (`underlying` は **options 配列順**で保証)
+
+**成功判定**: `factory().start()` が throw しなかったら採用。peer 発見 0 台でも問題なし (Phase 2 では peer 発見が後続で起きる設計)。
+
+**状態管理とレース対策**
+
+FailoverTransport は 4 状態 state machine を持つ:
+
+```swift
+private enum State {
+    case idle       // 未起動、または stop 完了後
+    case starting   // start() が factory ループ実行中
+    case running    // active Transport が動作中
+    case stopping   // stop() 実行中
+}
+```
+
+NSLock で state 遷移を直列化する。`start()` 冒頭と `stop()` 冒頭で state を確認・更新し、以下のルールを強制:
+
+- `idle → starting`: `start()` 開始時
+- `starting → running`: start ループが成功して active がセットされた時
+- `running → stopping`: `stop()` が呼ばれた時
+- `stopping → idle`: stop 完了後
+- **`starting` 中の `stop()`**: starting の完了を待ってから stopping に遷移 (start ループを中断するのではなく、成功した Transport を正しく stop するため)
+- 二重 start (`running` 中の start) と二重 stop は no-op
+
+**API**
+
+```swift
+public final class FailoverTransport: Transport, @unchecked Sendable {
+
+    public struct Option: Sendable {
+        public let label: String
+        public let factory: @Sendable () -> any Transport
+        public init(label: String, factory: @escaping @Sendable () -> any Transport) {
+            self.label = label
+            self.factory = factory
+        }
+    }
+
+    public let peers: AsyncStream<Set<PeerID>>
+    public let incomingMessages: AsyncStream<(PeerID, Data)>
+
+    public init(options: [Option])
+
+    /// 現在 active な Transport のラベル (start 前は nil)。
+    /// 読み書きは同一の NSLock で保護されており、UI スレッドからの参照も安全。
+    public var activeLabel: String? { get }
+
+    public func start() async throws
+    public func stop() async
+    public func send(_ data: Data, to peer: PeerID) async throws
+    public func broadcast(_ data: Data) async throws
+    public func broadcastUnreliable(_ data: Data) async throws
+}
+
+public enum FailoverTransportError: Error, Sendable {
+    /// options 配列が空のまま start() が呼ばれた。
+    case noOptionsAvailable
+    /// 全 option の factory().start() が throw した。underlying は options 配列順。
+    case allOptionsFailed(underlying: [Error])
+}
+
+// send / broadcast / broadcastUnreliable が active Transport に委譲中に
+// throw した場合、FailoverTransport は active を維持する (runtime 切替なし)。
+// エラーはそのまま呼び出し元に伝播する。
+```
+
+**ストリーム forward**
+
+`start()` 時に 2 つの Task を起動し、active Transport の `peers` / `incomingMessages` を FailoverTransport 自身の continuation に yield する。既存の `WiFiTransport` / `MultipeerTransport` は `stop()` で upstream の AsyncStream を finish するため、forward ループの `for await` はそれに連動して自然終了する。
+
+**stop() の順序** (重要):
+
+```
+1. state を stopping に遷移 (lock)
+2. active Transport の stop() を await — これで upstream が finish
+3. forward task の完了を await (自然終了)、タイムアウト保険として Task.cancel() も実行
+4. 自身の continuation を finish
+5. state を idle に遷移
+```
+
+自身の continuation を `stop()` 時に **finish する**。これにより上位層の `for await` ループ (PeerClock など) が正しく解放される。`PeerClock` 側は Phase 1 の設計通り `start()` ごとに `transportFactory` で新しい Transport を生成するため、FailoverTransport を再利用する必要はない (使い切り)。
+
+**初期 peer snapshot の取りこぼしなし**: Active Transport の `peers` AsyncStream は upstream の全イベントを順序通り forward する。start() 完了時点で active Transport は既にイベント発行を始めているので、初期 snapshot (空 set を含む) はすべて forward task 経由で上位の Phase 3a `runCoordinationLoop` に届く。`flushNow()` は `added.isEmpty == false` 時にトリガされるので取りこぼしは発生しない。
+
+**PeerClock facade 拡張**
+
+```swift
+extension PeerClock {
+    /// Active Transport のラベル。FailoverTransport 使用時のみ非 nil。
+    public var activeTransportLabel: String? {
+        let transport = lock.withLock { self.transport }
+        return (transport as? FailoverTransport)?.activeLabel
+    }
+}
+```
+
+**Demo app 統合**
+
+`Transport: [WiFi] [MC] [Auto]` の 3 択 Picker に拡張。Auto モード選択時は以下のような factory を渡す:
+
+```swift
+FailoverTransport(options: [
+    .init(label: "WiFi") { WiFiTransport(localPeerID: id, configuration: .default) },
+    .init(label: "MC")   { MultipeerTransport(localPeerID: id, configuration: .default) }
+])
+```
+
+Active ラベルを Sync Status 行に小さく `via WiFi` / `via MC` として表示。
+
+**Picker 無効化**: Phase 3b で既に導入した `!viewModel.isStopped` による disabled ロジックをそのまま再利用。起動中の Transport 切替は許さず、ユーザは Stop → 選択変更 → Start のフローで行う。
+
+**テスト戦略**
+
+- **ユニット**: `ThrowingMockTransport` (start() が常に throw) を追加し、FailoverTransport の全ケースをカバー:
+  - 1 つ目が throw → 2 つ目に fallback で成功
+  - 全 option が throw → `allOptionsFailed` エラー
+  - 空 options → `noOptionsAvailable` エラー
+  - Active の peers ストリームが forward される
+  - `send` / `broadcast` / `broadcastUnreliable` が active に委譲される
+  - `stop()` 後の送信が安全にエラーになる
+  - `activeLabel` が成功した option の label を返す
+- **実機**: Auto モードで起動、Local Network permission 拒否ケースで WiFi → MC にフォールバックを目視確認
+
+**Phase 1-3b との関係**
+
+- Transport protocol 準拠のラッパなので上位層に変更なし
+- Phase 3a の再接続は active Transport 内で動く (WiFi 側は WiFiTransport のリトライ、MC 側は MCSession の内部リトライ)
+- Phase 3b の MultipeerTransport をそのまま再利用
 
 #### Phase 3d: バックグラウンドモード
 

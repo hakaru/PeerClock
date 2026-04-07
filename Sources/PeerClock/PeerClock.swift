@@ -44,6 +44,12 @@ public final class PeerClock: @unchecked Sendable {
         lock.withLock { currentCoordinator }
     }
 
+    /// FailoverTransport 使用時のみ非 nil。現在 active な Transport の label を返す。
+    public var activeTransportLabel: String? {
+        let current = lock.withLock { transport }
+        return (current as? FailoverTransport)?.activeLabel
+    }
+
     // MARK: - Private: Configuration
 
     private let configuration: Configuration
