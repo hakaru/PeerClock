@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		163F0C022F84AA0200FBD277 /* PeerClock in Frameworks */ = {isa = PBXBuildFile; productRef = 163F0C012F84AA0100FBD277 /* PeerClock */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		163F0B0C2F84A9E200FBD277 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -42,6 +46,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				163F0C022F84AA0200FBD277 /* PeerClock in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -100,6 +105,7 @@
 			);
 			name = PeerClockDemo;
 			packageProductDependencies = (
+				163F0C012F84AA0100FBD277 /* PeerClock */,
 			);
 			productName = PeerClockDemo;
 			productReference = 163F0AFE2F84A9E000FBD277 /* PeerClockDemo.app */;
@@ -177,6 +183,9 @@
 			);
 			mainGroup = 163F0AF52F84A9E000FBD277;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				163F0C002F84AA0000FBD277 /* XCLocalSwiftPackageReference "../.." */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 163F0AFF2F84A9E000FBD277 /* Products */;
 			projectDirPath = "";
@@ -249,6 +258,21 @@
 			targetProxy = 163F0B162F84A9E200FBD277 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		163F0C002F84AA0000FBD277 /* XCLocalSwiftPackageReference "../.." */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = "../..";
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		163F0C012F84AA0100FBD277 /* PeerClock */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 163F0C002F84AA0000FBD277 /* XCLocalSwiftPackageReference "../.." */;
+			productName = PeerClock;
+		};
+/* End XCSwiftPackageProductDependency section */
 
 /* Begin XCBuildConfiguration section */
 		163F0B1D2F84A9E200FBD277 /* Debug */ = {
