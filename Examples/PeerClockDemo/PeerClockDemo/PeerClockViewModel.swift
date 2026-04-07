@@ -217,14 +217,18 @@ final class PeerClockViewModel {
         guard let clock else { return }
         let target = clock.now + 3_000_000_000
         appendLog("Scheduling fire at +3s (synced)")
-        let handle = await clock.schedule(atSyncedTime: target) { [weak self] in
-            Task { @MainActor in
-                let stamp = ISO8601DateFormatter().string(from: Date())
-                self?.lastScheduledFireLog = "🔔 fired at \(stamp)"
-                self?.appendLog("🔔 Scheduled event fired")
+        do {
+            let handle = try await clock.schedule(atSyncedTime: target) { [weak self] in
+                Task { @MainActor in
+                    let stamp = ISO8601DateFormatter().string(from: Date())
+                    self?.lastScheduledFireLog = "🔔 fired at \(stamp)"
+                    self?.appendLog("🔔 Scheduled event fired")
+                }
             }
+            scheduleHandle = handle
+        } catch {
+            appendLog("⚠️ schedule failed: \(error)")
         }
-        scheduleHandle = handle
     }
 
     func cancelScheduledBeep() async {
