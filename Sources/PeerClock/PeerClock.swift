@@ -73,8 +73,8 @@ public final class PeerClock: @unchecked Sendable {
     ) {
         self.localPeerID = PeerID(UUID())
         self.configuration = configuration
-        self.transportFactory = transportFactory ?? { _ in
-            fatalError("WiFiTransport not yet implemented — use transportFactory for testing")
+        self.transportFactory = transportFactory ?? { peerID in
+            WiFiTransport(localPeerID: peerID, configuration: configuration)
         }
 
         var syncStateCont: AsyncStream<SyncState>.Continuation!
