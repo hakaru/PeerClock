@@ -196,6 +196,13 @@ final class PeerClockViewModel {
             coordinatorLabel = "none"
             isLocalCoordinator = false
         }
+        // Coordinator 自身は常に自分の時計が基準なので synced 扱いにする
+        if isLocalCoordinator, case .running = runState {
+            syncStateLabel = "synced"
+            syncOffsetMs = 0
+            syncConfidence = 1.0
+            syncRoundTripMs = 0
+        }
     }
 
     private func appendLog(_ message: String) {
