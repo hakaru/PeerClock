@@ -186,8 +186,13 @@ public final class PeerClock: Sendable {
     public var commands: AsyncStream<(PeerID, Command)> { get }
 
     // --- ステータス ---
-    public func setStatus(_ value: any Codable & Sendable, forKey key: String)
+    // Codable 版（内部で binary plist エンコード）
+    public func setStatus<T: Codable & Sendable>(_ value: T, forKey key: String) async
+    // Raw 版（アプリが自前でシリアライズ）
+    public func setStatus(_ data: Data, forKey key: String) async
+    // 切断後も最後の既知値を返す。stale 判定は peer.status.connectionState == .disconnected で行う
     public func status(of peer: PeerID) -> PeerStatus?
+    // ピア単位、受信側 debounce で集約
     public var statusUpdates: AsyncStream<(PeerID, PeerStatus)> { get }
 }
 ```
@@ -254,7 +259,10 @@ public enum Platform: Sendable {
 
 public struct Configuration: Sendable {
     public var heartbeatInterval: TimeInterval = 1.0
-    public var disconnectThreshold: Int = 3
+    public var degradedAfter: TimeInterval = 1.5       // 最終受信からの経過時間で判定
+    public var disconnectedAfter: TimeInterval = 3.0
+    public var statusSendDebounce: TimeInterval = 0.1  // 送信側 debounce
+    public var statusReceiveDebounce: TimeInterval = 0.05 // 受信側 statusUpdates 集約
     public var syncInterval: TimeInterval = 5.0
     public var syncMeasurements: Int = 40
     public var syncMeasurementInterval: TimeInterval = 0.03
@@ -375,8 +383,9 @@ Coordinator が SYNC_REQUEST を受け取り SYNC_RESPONSE を返す。どのノ
 ### ステータスキー名前空間
 
 - `pc.*` — PeerClock 予約（共通ステータス）
-  - `pc.connection`, `pc.sync.offset`, `pc.sync.quality`
-  - `pc.device.name`, `pc.device.battery`, `pc.device.storage`
+  - **Phase 2a で自動プッシュ**: `pc.sync.offset`, `pc.sync.quality`, `pc.device.name`
+  - **将来追加候補**: `pc.device.battery`, `pc.device.storage`（Phase 3+）
+  - **廃止**: `pc.connection` — 接続状態は `Peer.status.connectionState` のみで公開（観察者視点の情報であり「自分が公開する情報」というステータス層の意味づけと分離するため）
 - それ以外 — アプリ定義（例: `com.1take.recording.state`）
 
 ### Transport マッピング
@@ -413,7 +422,7 @@ connected ──(1回ミス)──→ degraded ──(閾値超え)──→ dis
 - `disconnected`: 再接続フローに入る。coordinator だった場合は自動で再選出
 - RemoteStatusStore のエントリは保持（最後の既知状態）、stale フラグ付き
 - 再接続時にフルステータス交換（`generation` 比較で新旧判定）
-- **ハートビートのデフォルト値（間隔・閾値）は Phase 1 の実機テストで決定**
+- **ハートビート方式（Phase 2a 確定）**: 各ピアが `heartbeatInterval`（既定 1.0s）おきに `HEARTBEAT` を reliable broadcast（片方向、要求応答なし）。受信側は「最後に受信した時刻」を記録し、`degradedAfter`（既定 1.5s）・`disconnectedAfter`（既定 3.0s）で状態遷移。デフォルト値は実機テストで調整可能。
 
 ---
 
@@ -430,12 +439,20 @@ connected ──(1回ミス)──→ degraded ──(閾値超え)──→ dis
 - `MockTransport` によるユニットテスト
 - 実機2台で動作確認
 
-### Phase 2: ステータス + イベントスケジューリング
+### Phase 2a: ステータス共有 + ハートビート
 
-- `StatusRegistry` + `StatusBroadcaster`（世代番号、debounce）
-- ハートビート + connected/degraded/disconnected 状態遷移
-- `EventScheduler`: mach_absolute_time ベース精密発火
-- 実機テストでハートビートのデフォルト値を決定
+- `StatusRegistry` + `StatusBroadcaster`（世代番号、送信側 100ms debounce、受信側 50ms debounce）
+- `setStatus` は Codable 版（内部 binary plist）と Raw `Data` 版を並置
+- 自動プッシュする共通ステータス: `pc.sync.offset`, `pc.sync.quality`, `pc.device.name`
+- `HeartbeatMonitor`: 片方向 HEARTBEAT broadcast + 時間ベース状態遷移
+- 接続状態は `Peer.status.connectionState` で公開（`pc.connection` は廃止）
+- 切断後も RemoteStatusStore のエントリは保持（最後の既知値）
+- 実機テストでハートビートのデフォルト値を調整
+
+### Phase 2b: イベントスケジューリング
+
+- `EventScheduler`: 同期済み時刻での精密発火（mach_continuous_time ベース）
+- API 形（facade 直下 vs 独立型）は 2a 実装完了後に確定
 
 ### Phase 3: レジリエンス
 
