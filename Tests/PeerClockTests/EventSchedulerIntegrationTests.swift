@@ -24,7 +24,7 @@ struct EventSchedulerIntegrationTests {
 
         let box = Box()
         let when = clock.now + 80_000_000 // 80ms 後
-        let handle = await clock.schedule(atSyncedTime: when) {
+        let handle = try await clock.schedule(atSyncedTime: when) {
             let t = NTPSyncEngine.now()
             Task { await box.mark(t) }
         }
@@ -47,7 +47,7 @@ struct EventSchedulerIntegrationTests {
 
         let box = Box()
         let when = clock.now + 200_000_000 // 200ms 後
-        let handle = await clock.schedule(atSyncedTime: when) {
+        let handle = try await clock.schedule(atSyncedTime: when) {
             let t = NTPSyncEngine.now()
             Task { await box.mark(t) }
         }
@@ -86,11 +86,11 @@ struct EventSchedulerIntegrationTests {
 
         // A の now + 200ms を共有ターゲットとして両方に予約
         let target = a.now + 200_000_000
-        _ = await a.schedule(atSyncedTime: target) {
+        _ = try await a.schedule(atSyncedTime: target) {
             let t = NTPSyncEngine.now()
             Task { await times.add("a", t) }
         }
-        _ = await b.schedule(atSyncedTime: target) {
+        _ = try await b.schedule(atSyncedTime: target) {
             let t = NTPSyncEngine.now()
             Task { await times.add("b", t) }
         }
