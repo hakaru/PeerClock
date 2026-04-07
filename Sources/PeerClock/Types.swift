@@ -12,6 +12,10 @@ public struct PeerID: Hashable, Sendable, Comparable, CustomStringConvertible {
         self.rawValue = uuid
     }
 
+    public init(rawValue: UUID) {
+        self.rawValue = rawValue
+    }
+
     public static func < (lhs: PeerID, rhs: PeerID) -> Bool {
         lhs.rawValue.uuidString < rhs.rawValue.uuidString
     }
