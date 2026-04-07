@@ -7,6 +7,9 @@ public enum Message: Sendable, Equatable {
     case commandBroadcast(Command)
     case commandUnicast(Command)
     case heartbeat
+    case statusPush(senderID: PeerID, generation: UInt64, entries: [StatusEntry])
+    case statusRequest(senderID: PeerID, correlation: UInt16)
+    case statusResponse(senderID: PeerID, correlation: UInt16, generation: UInt64, entries: [StatusEntry])
     case disconnect
 
     internal var typeByte: UInt8 {
@@ -17,6 +20,9 @@ public enum Message: Sendable, Equatable {
         case .commandBroadcast: return 0x10
         case .commandUnicast: return 0x11
         case .heartbeat: return 0x20
+        case .statusPush: return 0x30
+        case .statusRequest: return 0x31
+        case .statusResponse: return 0x32
         case .disconnect: return 0xFF
         }
     }
