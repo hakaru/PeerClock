@@ -186,8 +186,8 @@ public final class PeerClock: Sendable {
     public var commands: AsyncStream<(PeerID, Command)> { get }
 
     // --- ステータス ---
-    // Codable 版（内部で binary plist エンコード）
-    public func setStatus<T: Codable & Sendable>(_ value: T, forKey key: String) async
+    // Codable 版（内部で binary plist エンコード。エンコード失敗時は throws）
+    public func setStatus<T: Codable & Sendable>(_ value: T, forKey key: String) async throws
     // Raw 版（アプリが自前でシリアライズ）
     public func setStatus(_ data: Data, forKey key: String) async
     // 切断後も最後の既知値を返す。stale 判定は peer.status.connectionState == .disconnected で行う
@@ -259,8 +259,8 @@ public enum Platform: Sendable {
 
 public struct Configuration: Sendable {
     public var heartbeatInterval: TimeInterval = 1.0
-    public var degradedAfter: TimeInterval = 1.5       // 最終受信からの経過時間で判定
-    public var disconnectedAfter: TimeInterval = 3.0
+    public var degradedAfter: TimeInterval = 2.0       // 最終受信からの経過時間で判定
+    public var disconnectedAfter: TimeInterval = 5.0   // AWDL/BG 瞬断に耐えるため緩め
     public var statusSendDebounce: TimeInterval = 0.1  // 送信側 debounce
     public var statusReceiveDebounce: TimeInterval = 0.05 // 受信側 statusUpdates 集約
     public var syncInterval: TimeInterval = 5.0
@@ -319,7 +319,7 @@ for await (peerID, status) in clock.statusUpdates {
 - **Length**: ペイロード長（2 bytes, big-endian, 最大 65535 bytes）
 - **Payload**: 可変長。整数は全て big-endian。文字列は UTF-8。
 
-#### Unreliable チャネル（クロック同期）
+#### Unreliable チャネル（クロック同期 + ハートビート）
 
 方向非依存 — どのピアからでも送受信可能。
 
@@ -327,6 +327,9 @@ for await (peerID, status) in clock.statusUpdates {
 |---|---|---|
 | 0x01 | SYNC_REQUEST | 同期要求（t0 を含む） |
 | 0x02 | SYNC_RESPONSE | 同期応答（t0, t1, t2 を含む） |
+| 0x03 | HEARTBEAT | 生存通知（各ピアが broadcast、fire-and-forget） |
+
+**ハートビートは unreliable チャネル**（UDP / MCSession `.unreliable`）を使う。理由: TCP 再送・バッファ滞留により「切断検知」が逆に遅延するのを避けるため。順序性・到達保証は不要で「最新が最良」。1 発ロスは次の間隔で即座に補填される。
 
 ペイロード: 24 bytes（UInt64 × 3 タイムスタンプ、mach_continuous_time ナノ秒、big-endian）
 
@@ -336,7 +339,7 @@ Coordinator が SYNC_REQUEST を受け取り SYNC_RESPONSE を返す。どのノ
 
 | Category | 名前 | 用途 |
 |---|---|---|
-| 0x10 | SYSTEM_COMMAND | HEARTBEAT, DISCONNECT, DEVICE_INFO |
+| 0x10 | SYSTEM_COMMAND | DISCONNECT, DEVICE_INFO（HEARTBEAT は unreliable に移動） |
 | 0x11 | ELECTION | Coordinator 選出メッセージ |
 | 0x20 | APP_COMMAND | 汎用コマンド |
 | 0x30 | STATUS_PUSH | ステータスブロードキャスト |
@@ -404,7 +407,25 @@ Coordinator が SYNC_REQUEST を受け取り SYNC_RESPONSE を返す。どのノ
 状態変化時に StatusBroadcaster が reliable チャネルで全ピアに STATUS_PUSH を送信。
 - 共通ステータス（`pc.*`）: PeerClock が自動プッシュ
 - カスタムステータス: アプリが `setStatus(_:forKey:)` を呼ぶたびにプッシュ
-- 高頻度更新に対する debounce: 同一キーの更新が 100ms 以内に連続した場合、最後の値だけ送信（Configuration で調整可能）
+- **送信側 debounce（100ms, 調整可）**: `setStatus` は「dirty」マークだけ付けて即座には送信しない。100ms の flush タイマーでまとめて1つの STATUS_PUSH にする。flush 時に `generation` を +1 して現在の全ローカルステータスのスナップショットを送信
+- **generation の進め方**: ピア単位の monotonic counter、**送信スナップショット単位で increment**（キー単位ではない）。受信側は `(peerID, generation)` で古い/重複 push を弾く
+- **受信側 debounce（50ms, 調整可）**: `statusUpdates` AsyncStream への配信は同一ピアの連続更新を 50ms 窓で集約し、UI の過剰発火を抑える
+
+### Actor 境界（Swift 6 strict concurrency）
+
+```
+[App] ──setStatus──▶ [StatusRegistry: actor] ──push──▶ [Transport]
+                          │ (local state + 100ms flush timer)
+                          │
+[Transport] ──recv──▶ [StatusReceiver: actor] ──debounce──▶ [AsyncStream]
+                          │ (remote store + 50ms debounce timer)
+                          │
+                      [MainActor] ◀── Observation snapshot (facade 経由)
+```
+
+- `StatusRegistry` (actor): ローカルステータス保持、送信側 debounce タイマー、generation 発番
+- `StatusReceiver` (actor): リモートステータスストア、受信側 debounce タイマー、`statusUpdates` AsyncStream 生成
+- `PeerClock` facade: `status(of:)` / `statusUpdates` は `StatusReceiver` から取得。UI 用の Observation スナップショットは将来検討
 
 ### プル（オンデマンド）
 
@@ -422,7 +443,7 @@ connected ──(1回ミス)──→ degraded ──(閾値超え)──→ dis
 - `disconnected`: 再接続フローに入る。coordinator だった場合は自動で再選出
 - RemoteStatusStore のエントリは保持（最後の既知状態）、stale フラグ付き
 - 再接続時にフルステータス交換（`generation` 比較で新旧判定）
-- **ハートビート方式（Phase 2a 確定）**: 各ピアが `heartbeatInterval`（既定 1.0s）おきに `HEARTBEAT` を reliable broadcast（片方向、要求応答なし）。受信側は「最後に受信した時刻」を記録し、`degradedAfter`（既定 1.5s）・`disconnectedAfter`（既定 3.0s）で状態遷移。デフォルト値は実機テストで調整可能。
+- **ハートビート方式（Phase 2a 確定）**: 各ピアが `heartbeatInterval`（既定 1.0s）おきに `HEARTBEAT` を **unreliable broadcast**（片方向、fire-and-forget）。TCP 再送バッファによる検知遅延を避けるため reliable は使わない。受信側は「最後に受信した時刻」を記録し、`degradedAfter`（既定 2.0s）・`disconnectedAfter`（既定 5.0s）で状態遷移。AWDL チャネルホッピングや iOS バックグラウンドの瞬断（〜1s）に耐えるよう保守的に設定。実機テストで調整可能。
 
 ---
 
