@@ -6,8 +6,12 @@ public final class CommandRouter: CommandHandler, @unchecked Sendable {
     private let transport: any Transport
     private var listenTask: Task<Void, Never>?
     private var commandContinuation: AsyncStream<(PeerID, Command)>.Continuation?
+    private var syncMessageContinuation: AsyncStream<(PeerID, Data)>.Continuation?
 
     public let incomingCommands: AsyncStream<(PeerID, Command)>
+    /// 同期メッセージ (SYNC_REQUEST/SYNC_RESPONSE) の生データを流す副ストリーム。
+    /// reliableMessages の単一コンシューマ制約を回避するため CommandRouter が中央分配する。
+    let syncMessages: AsyncStream<(PeerID, Data)>
 
     public init(transport: any Transport) {
         self.transport = transport
@@ -15,6 +19,10 @@ public final class CommandRouter: CommandHandler, @unchecked Sendable {
         var continuation: AsyncStream<(PeerID, Command)>.Continuation!
         incomingCommands = AsyncStream { continuation = $0 }
         commandContinuation = continuation
+
+        var syncCont: AsyncStream<(PeerID, Data)>.Continuation!
+        syncMessages = AsyncStream { syncCont = $0 }
+        syncMessageContinuation = syncCont
 
         startListening()
     }
@@ -37,11 +45,17 @@ public final class CommandRouter: CommandHandler, @unchecked Sendable {
         listenTask = Task { [weak self] in
             guard let self else { return }
             for await (sender, data) in self.transport.reliableMessages {
-                guard let wire = try? MessageCodec.decode(data),
-                      wire.category == .appCommand,
-                      let command = try? MessageCodec.decodeCommand(wire.payload)
-                else { continue }
-                self.commandContinuation?.yield((sender, command))
+                guard let wire = try? MessageCodec.decode(data) else { continue }
+                switch wire.category {
+                case .appCommand:
+                    if let command = try? MessageCodec.decodeCommand(wire.payload) {
+                        self.commandContinuation?.yield((sender, command))
+                    }
+                case .syncRequest, .syncResponse:
+                    self.syncMessageContinuation?.yield((sender, data))
+                default:
+                    continue
+                }
             }
         }
     }
@@ -49,5 +63,6 @@ public final class CommandRouter: CommandHandler, @unchecked Sendable {
     deinit {
         listenTask?.cancel()
         commandContinuation?.finish()
+        syncMessageContinuation?.finish()
     }
 }

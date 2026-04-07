@@ -17,6 +17,7 @@ final class WiFiTransport: Transport, @unchecked Sendable {
     private var discovery: Discovery?
     private var tcpConnections: [PeerID: NWConnection] = [:]
     private var udpConnections: [PeerID: NWConnection] = [:]
+    private var inboundConnections: [PeerID: NWConnection] = [:]
     private var _connectedPeers: Set<PeerID> = []
     private var discoveryTask: Task<Void, Never>?
 
@@ -59,6 +60,9 @@ final class WiFiTransport: Transport, @unchecked Sendable {
 
     func start() throws {
         let disc = try Discovery(serviceName: configuration.serviceName, localPeerID: localPeerID)
+        disc.inboundConnectionHandler = { [weak self] connection in
+            self?.handleInboundConnection(connection)
+        }
         lock.withLock { self.discovery = disc }
 
         disc.start()
@@ -85,23 +89,26 @@ final class WiFiTransport: Transport, @unchecked Sendable {
     }
 
     func stop() {
-        let (disc, task, tcpConns, udpConns) = lock.withLock { () -> (Discovery?, Task<Void, Never>?, [NWConnection], [NWConnection]) in
+        let (disc, task, tcpConns, udpConns, inConns) = lock.withLock { () -> (Discovery?, Task<Void, Never>?, [NWConnection], [NWConnection], [NWConnection]) in
             let d = discovery
             discovery = nil
             let t = discoveryTask
             discoveryTask = nil
             let tcp = Array(tcpConnections.values)
             let udp = Array(udpConnections.values)
+            let inb = Array(inboundConnections.values)
             tcpConnections = [:]
             udpConnections = [:]
+            inboundConnections = [:]
             _connectedPeers = []
-            return (d, t, tcp, udp)
+            return (d, t, tcp, udp, inb)
         }
 
         task?.cancel()
         disc?.stop()
         tcpConns.forEach { $0.cancel() }
         udpConns.forEach { $0.cancel() }
+        inConns.forEach { $0.cancel() }
 
         unreliableCont.finish()
         reliableCont.finish()
@@ -180,21 +187,24 @@ final class WiFiTransport: Transport, @unchecked Sendable {
             udpConnections[peerID] = udpConnection
         }
 
-        FileHandle.standardError.write(Data("[WiFiTransport] connectToPeer \(peerID) endpoint=\(endpoint)\n".utf8))
         // TCP状態ハンドラ
         tcpConnection.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
-            FileHandle.standardError.write(Data("[WiFiTransport] tcp \(peerID) state: \(state)\n".utf8))
             switch state {
             case .ready:
                 _ = self.lock.withLock { self._connectedPeers.insert(peerID) }
                 self.connectionCont.yield(.peerJoined(peerID))
-                self.receiveReliable(from: peerID, connection: tcpConnection)
+                // outbound への handshake (自分の UUID 16 bytes) を送信
+                // → 相手の inbound 側で読み取り peer ID として登録される
+                let handshake = withUnsafeBytes(of: self.localPeerID.rawValue.uuid) { Data($0) }
+                tcpConnection.send(content: handshake, completion: .contentProcessed { _ in })
+                // outbound は送信専用。受信は inbound 接続側で行う
 
             case .failed, .cancelled:
                 self.lock.withLock {
                     self._connectedPeers.remove(peerID)
                     self.tcpConnections.removeValue(forKey: peerID)
+                    self.inboundConnections.removeValue(forKey: peerID)
                 }
                 self.connectionCont.yield(.peerLeft(peerID))
 
@@ -222,6 +232,32 @@ final class WiFiTransport: Transport, @unchecked Sendable {
 
         tcpConnection.start(queue: queue)
         udpConnection.start(queue: queue)
+    }
+
+    /// Discovery が accept した inbound TCP 接続を処理する。
+    /// 16-byte handshake (peer UUID) を読み取り、peer ID を確定してから受信ループを開始する。
+    private func handleInboundConnection(_ connection: NWConnection) {
+        connection.receive(minimumIncompleteLength: 16, maximumLength: 16) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
+            guard let data, data.count == 16, error == nil else {
+                if isComplete { connection.cancel() }
+                return
+            }
+            let uuid = data.withUnsafeBytes { ptr -> UUID in
+                let bytes = ptr.bindMemory(to: UInt8.self)
+                return UUID(uuid: (
+                    bytes[0], bytes[1], bytes[2], bytes[3],
+                    bytes[4], bytes[5], bytes[6], bytes[7],
+                    bytes[8], bytes[9], bytes[10], bytes[11],
+                    bytes[12], bytes[13], bytes[14], bytes[15]
+                ))
+            }
+            let peerID = PeerID(rawValue: uuid)
+            self.lock.withLock {
+                self.inboundConnections[peerID] = connection
+            }
+            self.receiveReliable(from: peerID, connection: connection)
+        }
     }
 
     private func handlePeerLost(endpoint: NWEndpoint) {

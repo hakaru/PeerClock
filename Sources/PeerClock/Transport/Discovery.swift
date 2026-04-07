@@ -25,6 +25,10 @@ final class Discovery: @unchecked Sendable {
     private var discoveredContinuation: AsyncStream<DiscoveryEvent>.Continuation?
     let events: AsyncStream<DiscoveryEvent>
 
+    /// 新しい inbound 接続を WiFiTransport へ引き渡すコールバック。
+    /// WiFiTransport が start 前にセットする。
+    var inboundConnectionHandler: ((NWConnection) -> Void)?
+
     // MARK: - Init
 
     init(serviceName: String, localPeerID: PeerID) throws {
@@ -59,24 +63,20 @@ final class Discovery: @unchecked Sendable {
     func start() {
         // Network.framework validates that a listener can accept inbound connections
         // before it transitions out of setup; without a handler, start() fails with EINVAL.
-        listener.newConnectionHandler = { connection in
-            FileHandle.standardError.write(Data("[Discovery] accepted inbound connection: \(connection.endpoint)\n".utf8))
+        listener.newConnectionHandler = { [weak self] connection in
+            guard let self else { return }
             connection.start(queue: self.queue)
+            self.inboundConnectionHandler?(connection)
         }
 
         // リスナーの状態ハンドラ
         listener.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
-            FileHandle.standardError.write(Data("[Discovery] listener state: \(state)\n".utf8))
             if case .ready = state, let port = self.listener.port {
                 self.discoveredContinuation?.yield(.listenerReady(port))
             }
         }
         listener.start(queue: queue)
-
-        browser.stateUpdateHandler = { state in
-            FileHandle.standardError.write(Data("[Discovery] browser state: \(state)\n".utf8))
-        }
 
         // ブラウザーの結果変更ハンドラ
         browser.browseResultsChangedHandler = { [weak self] results, changes in

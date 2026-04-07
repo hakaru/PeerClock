@@ -18,6 +18,8 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
 
     private let transport: any Transport
     private let configuration: Configuration
+    /// reliableMessages を直接読まず、CommandRouter からの sync メッセージストリームを使う
+    private let syncMessageStream: AsyncStream<(PeerID, Data)>
 
     /// ロック保護されたクロックオフセット (秒単位)
     private let lock = NSLock()
@@ -39,9 +41,14 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
 
     // MARK: - Init
 
-    public init(transport: any Transport, configuration: Configuration = .default) {
+    public init(
+        transport: any Transport,
+        configuration: Configuration = .default,
+        syncMessageStream: AsyncStream<(PeerID, Data)>
+    ) {
         self.transport = transport
         self.configuration = configuration
+        self.syncMessageStream = syncMessageStream
 
         var continuation: AsyncStream<SyncState>.Continuation!
         self.syncStateUpdates = AsyncStream { continuation = $0 }
@@ -70,7 +77,8 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
         task?.cancel()
         // タスクが終了するまで待機
         await task?.value
-        syncStateContinuation.finish()
+        // syncStateContinuation は finish しない:
+        // PeerClock がフォロワー切り替え時に stop() → start() を連続呼びするため
     }
 
     // MARK: - Core Loop
@@ -120,9 +128,10 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
         // 測定結果を蓄積するアクター
         let collector = MeasurementCollector()
 
-        // レスポンスリスナータスク
-        let listenerTask = Task { [transport] in
-            for await (sender, data) in transport.unreliableMessages {
+        // レスポンスリスナータスク (CommandRouter 経由で配信される sync メッセージを受信)
+        let stream = self.syncMessageStream
+        let listenerTask = Task {
+            for await (sender, data) in stream {
                 guard sender == coordinator else { continue }
                 guard let message = try? MessageCodec.decode(data),
                       message.category == .syncResponse,
@@ -143,7 +152,7 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
             let payload = MessageCodec.encodeSyncRequest(t0: t0)
             let message = WireMessage(category: .syncRequest, payload: payload)
             let data = MessageCodec.encode(message)
-            try? await transport.sendUnreliable(data, to: coordinator)
+            try? await transport.sendReliable(data, to: coordinator)
 
             do {
                 try await Task.sleep(for: .seconds(interval))

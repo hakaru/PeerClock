@@ -104,14 +104,18 @@ public final class PeerClock: @unchecked Sendable {
             let elec = CoordinatorElection(localPeerID: localPeerID)
             self.election = elec
 
-            let eng = NTPSyncEngine(transport: newTransport, configuration: configuration)
+            let router = CommandRouter(transport: newTransport)
+            self.commandRouter = router
+
+            let eng = NTPSyncEngine(
+                transport: newTransport,
+                configuration: configuration,
+                syncMessageStream: router.syncMessages
+            )
             self.syncEngine = eng
 
             let dm = DriftMonitor()
             self.driftMonitor = dm
-
-            let router = CommandRouter(transport: newTransport)
-            self.commandRouter = router
 
             // 自分自身は最初から既知ピアに含める
             knownPeers = [localPeerID]
@@ -267,9 +271,11 @@ public final class PeerClock: @unchecked Sendable {
         }
         existing?.cancel()
 
+        let syncStream = lock.withLock { commandRouter?.syncMessages }
+        guard let syncStream else { return }
         let task = Task { [weak self] in
             guard self != nil else { return }
-            for await (sender, data) in transport.unreliableMessages {
+            for await (sender, data) in syncStream {
                 guard !Task.isCancelled else { break }
                 guard let message = try? MessageCodec.decode(data),
                       message.category == .syncRequest,
@@ -281,7 +287,7 @@ public final class PeerClock: @unchecked Sendable {
                 let responsePayload = MessageCodec.encodeSyncResponse(t0: t0, t1: t1, t2: t2)
                 let response = WireMessage(category: .syncResponse, payload: responsePayload)
                 let responseData = MessageCodec.encode(response)
-                try? await transport.sendUnreliable(responseData, to: sender)
+                try? await transport.sendReliable(responseData, to: sender)
             }
         }
 

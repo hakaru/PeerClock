@@ -59,7 +59,7 @@ struct NTPSyncEngineTests {
         let clientTransport = network.createTransport(for: clientID)
 
         let responderTask = Task {
-            for await (sender, data) in coordinatorTransport.unreliableMessages {
+            for await (sender, data) in coordinatorTransport.reliableMessages {
                 let message = try MessageCodec.decode(data)
                 if message.category == .syncRequest {
                     let t0 = try MessageCodec.decodeSyncRequest(message.payload)
@@ -69,13 +69,19 @@ struct NTPSyncEngineTests {
                         category: .syncResponse,
                         payload: MessageCodec.encodeSyncResponse(t0: t0, t1: t1, t2: t2)
                     )
-                    try await coordinatorTransport.sendUnreliable(MessageCodec.encode(response), to: sender)
+                    try await coordinatorTransport.sendReliable(MessageCodec.encode(response), to: sender)
                 }
             }
         }
 
+        let clientRouter = CommandRouter(transport: clientTransport)
         let config = Configuration(syncMeasurements: 4, syncMeasurementInterval: 0.01)
-        let engine = NTPSyncEngine(transport: clientTransport, configuration: config)
+        let engine = NTPSyncEngine(
+            transport: clientTransport,
+            configuration: config,
+            syncMessageStream: clientRouter.syncMessages
+        )
+        _ = clientRouter // 保持して読み取りタスクを生かす
         await engine.start(coordinator: coordinatorID)
 
         try await Task.sleep(for: .milliseconds(500))
