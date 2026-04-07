@@ -43,6 +43,12 @@ public struct Configuration: Sendable {
     /// Interval in seconds between individual measurements within a sync round.
     public let syncMeasurementInterval: TimeInterval
 
+    // MARK: - MultipeerConnectivity
+
+    public var mcServiceType: String
+
+    public var mcMaxPeers: Int
+
     // MARK: - Transport
 
     /// Bonjour service type string.
@@ -62,6 +68,8 @@ public struct Configuration: Sendable {
         syncInterval: TimeInterval = 5.0,
         syncMeasurements: Int = 40,
         syncMeasurementInterval: TimeInterval = 0.03,
+        mcServiceType: String = "peerclock-mpc",
+        mcMaxPeers: Int = 8,
         serviceType: String = "_peerclock._udp",
         protocolVersion: UInt16 = 1
     ) {
@@ -75,6 +83,8 @@ public struct Configuration: Sendable {
         self.syncInterval = syncInterval
         self.syncMeasurements = syncMeasurements
         self.syncMeasurementInterval = syncMeasurementInterval
+        self.mcServiceType = mcServiceType
+        self.mcMaxPeers = mcMaxPeers
         self.serviceType = serviceType
         self.protocolVersion = protocolVersion
     }
