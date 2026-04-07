@@ -97,6 +97,60 @@ struct NTPSyncEngineTests {
         responderTask.cancel()
     }
 
+    @Test("resetBackoff() does not crash when called during active sync")
+    func resetBackoffSmokeTest() async throws {
+        let network = MockNetwork()
+        let coordinatorID = PeerID(rawValue: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!)
+        let clientID = PeerID(rawValue: UUID(uuidString: "00000000-0000-0000-0000-000000000002")!)
+
+        let coordinatorTransport = await network.createTransport(for: coordinatorID)
+        let clientTransport = await network.createTransport(for: clientID)
+        try await coordinatorTransport.start()
+        try await clientTransport.start()
+
+        let responderTask = Task {
+            for await (sender, data) in coordinatorTransport.incomingMessages {
+                let message = try MessageCodec.decode(data)
+                if case .ping(_, let t0) = message {
+                    let response = Message.pong(
+                        peerID: coordinatorID,
+                        t0: t0,
+                        t1: t0 + 1_000_000,
+                        t2: t0 + 1_500_000
+                    )
+                    try await coordinatorTransport.send(MessageCodec.encode(response), to: sender)
+                }
+            }
+        }
+
+        let clientRouter = CommandRouter(transport: clientTransport)
+        let config = Configuration(
+            syncBackoffStages: [0.05, 0.5, 1.0],
+            syncBackoffPromoteAfter: 2,
+            syncMeasurements: 2,
+            syncMeasurementInterval: 0.01
+        )
+        let engine = NTPSyncEngine(
+            transport: clientTransport,
+            localPeerID: clientID,
+            configuration: config,
+            syncMessageStream: clientRouter.syncMessages
+        )
+        _ = clientRouter
+        await engine.start(coordinator: coordinatorID)
+
+        // 数サイクル待って backoff が進んだ状態で resetBackoff() を呼ぶ
+        try await Task.sleep(for: .milliseconds(300))
+        engine.resetBackoff()
+        // クラッシュせずに続行できることを確認
+        try await Task.sleep(for: .milliseconds(100))
+
+        await engine.stop()
+        await coordinatorTransport.stop()
+        await clientTransport.stop()
+        responderTask.cancel()
+    }
+
     @Test("start() resets currentOffset from previous session")
     func startResetsCurrentOffset() async {
         let network = MockNetwork()

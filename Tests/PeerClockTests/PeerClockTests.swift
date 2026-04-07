@@ -21,7 +21,7 @@ struct PeerClockTests {
     func twoPeerSync() async throws {
         let network = MockNetwork()
         let config = Configuration(
-            syncInterval: 1.0,
+            syncBackoffStages: [1.0],
             syncMeasurements: 4,
             syncMeasurementInterval: 0.01
         )
