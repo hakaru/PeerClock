@@ -618,10 +618,80 @@ public func cancel(_ id: UUID) {
 
 ### Phase 3: レジリエンス
 
-- `MultipeerTransport: Transport`
-- 自動トランスポート切替
-- 再接続ロジック + coordinator 再選出
-- バックグラウンドモード
+4 サブフェーズに分割して順次実装する:
+
+#### Phase 3a: 再接続 + Coordinator 再選出 (WiFi 単体で完結)
+
+2 層防御アーキテクチャでピアの一時切断からの自動復帰を実現する。
+
+**レイヤ 1: Transport 層の短期リトライ**
+- `WiFiTransport` が `NWConnection.stateUpdateHandler` で `.failed` / `.cancelled` を即検知
+- `reconnectRetryInterval` (既定 500ms) × `reconnectMaxAttempts` (既定 3) = 最大 1.5s のリトライウィンドウ
+- **旧 connection は `cancel()` で完全破棄**し新 connection のみ利用 (並存しない)
+- リトライ成功時は `peers` ストリームに変化を流さない (同じ PeerID のまま透過復帰)
+- リトライ失敗時は `peers` から削除して disconnect イベントを上位へ
+
+**レイヤ 2: 上位層の受動復帰**
+- `HeartbeatMonitor` が 5s 無音で `disconnected` 判定 (既存 Phase 2a)
+- `Discovery` の Bonjour browser は **常時継続中** なので、ピアが再 advertise すれば `peers` ストリームに自動再登場
+- 永久に失われる扱いはしない。タイムアウトなし
+- バックストップ: Transport 層がキャッチしそこねた TCP half-open ケースを HeartbeatMonitor がカバー
+
+**Coordinator 再選出**
+- 既存の `CoordinatorElection.updatePeers()` + `runCoordinationLoop` が peer リスト変更を検知して `coordinatorUpdates` に流す仕組みは Phase 1 で実装済み
+- Phase 3a では再選出パスを**精査 + テスト追加**し、以下を保証:
+  - 旧 coordinator が `.disconnected` になった時、新 coordinator 選出が走る
+  - 新 coordinator が自分の場合、`syncEngine.stop()` → `startSyncResponder` に切替
+  - 新 coordinator が他 peer の場合、`syncEngine.start(coordinator: newID)` で再同期開始
+  - 過渡状態で古い `syncResponderTask` が残らないよう cancel 徹底
+
+**再接続後のフル同期**
+
+再接続は「ピアの新規参加」として既存 join フローを流用する。peer が再出現した時点で自動的に:
+
+1. `CoordinatorElection.updatePeers()` で coordinator 再計算
+2. 新 coordinator 相手に `NTPSyncEngine.start(coordinator:)` で clock sync 再開
+3. **`StatusRegistry.flushNow()` を呼んで** ローカル全ステータスを STATUS_PUSH (Phase 3a で追加する配線)
+4. `HeartbeatMonitor.peerJoined(id)` で自動的に `connected` 状態に戻る
+
+「新規参加」と「再接続」の区別は不要。追加実装は `StatusRegistry.flushNow()` 呼び出しのみ。
+
+**Configuration 追加項目**
+```swift
+public var reconnectRetryInterval: TimeInterval = 0.5
+public var reconnectMaxAttempts: Int = 3
+```
+
+**MockNetwork 拡張** (テスト用)
+```swift
+public func simulateDisconnect(peer: PeerID)
+public func simulateReconnect(peer: PeerID)
+```
+
+**テスト戦略**
+- ユニット (MockNetwork 拡張): Transport リトライ、重複メッセージ排除、coordinator 再選出 (3 台)、フル再同期、heartbeat 状態復帰
+- 実機: シミュレータ 2 台で WiFi OFF/ON、3 台で coordinator を Stop して再選出確認
+
+#### Phase 3b: MultipeerConnectivity トランスポート
+
+- `MultipeerTransport: Transport` 実装
+- reliable / unreliable / unicast / broadcast の全経路を MCSession でサポート
+- 既存 `Transport` プロトコルに準拠、facade は差し替え可能
+- iOS/macOS 共通 API
+
+#### Phase 3c: 自動トランスポート切替
+
+- WiFi → MC フォールバック (ネットワーク非対応環境で MC 有効化)
+- トランスポート品質モニタリング (packet loss, RTT)
+- 切替判断ロジック
+- 切替時のステート引き継ぎ
+
+#### Phase 3d: バックグラウンドモード
+
+- iOS Background Modes (Audio, Voice over IP) との統合
+- `Task.sleep` vs `DispatchSourceTimer` の交換が必要か判断
+- AVAudioSession 起動中の精度維持
+- PeerClock 起動/停止 vs バックグラウンド遷移のライフサイクル
 
 ### Phase 4: 高度な同期
 
