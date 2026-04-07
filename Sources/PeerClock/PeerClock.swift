@@ -60,6 +60,7 @@ public final class PeerClock: @unchecked Sendable {
     private var statusRegistry: StatusRegistry?
     private var statusReceiver: StatusReceiver?
     private var heartbeatMonitor: HeartbeatMonitor?
+    private var eventScheduler: EventScheduler?
 
     // MARK: - Private: Tasks
 
@@ -68,6 +69,7 @@ public final class PeerClock: @unchecked Sendable {
     private var syncStateForwardTask: Task<Void, Never>?
     private var heartbeatRoutingTask: Task<Void, Never>?
     private var statusPushRoutingTask: Task<Void, Never>?
+    private var driftJumpRoutingTask: Task<Void, Never>?
 
     // MARK: - Private: Stream Continuations
 
@@ -125,6 +127,12 @@ public final class PeerClock: @unchecked Sendable {
 
             let dm = DriftMonitor()
             self.driftMonitor = dm
+
+            // EventScheduler — now クロージャは同期オフセット適用済み時刻を使う
+            let scheduler = EventScheduler(
+                now: { [weak self] in self?.now ?? 0 }
+            )
+            self.eventScheduler = scheduler
 
             // 自分自身は最初から既知ピアに含める
             knownPeers = [localPeerID]
@@ -185,6 +193,18 @@ public final class PeerClock: @unchecked Sendable {
         // syncEngine のステート更新を転送するタスク
         let eng = lock.withLock { syncEngine! }
         let dm = lock.withLock { driftMonitor! }
+
+        // DriftMonitor のジャンプを EventScheduler に転送するタスク
+        let scheduler = lock.withLock { eventScheduler! }
+        let driftJumpTask = Task {
+            for await jump in dm.jumps {
+                await scheduler.handleJump(
+                    oldOffsetNs: jump.oldOffsetNs,
+                    newOffsetNs: jump.newOffsetNs
+                )
+            }
+        }
+        lock.withLock { self.driftJumpRoutingTask = driftJumpTask }
         let cont = syncStateContinuation
         let forwardTask = Task {
             for await state in eng.syncStateUpdates {
@@ -219,18 +239,20 @@ public final class PeerClock: @unchecked Sendable {
 
     /// 同期を停止する
     public func stop() async {
-        let (coordTask, syncResponder, fwdTask, hbTask, spTask, eng, tr, registry, receiver, heartbeat) = lock.withLock {
+        let (coordTask, syncResponder, fwdTask, hbTask, spTask, djTask, eng, tr, registry, receiver, heartbeat, sched) = lock.withLock {
             let c = coordinationTask; coordinationTask = nil
             let s = syncResponderTask; syncResponderTask = nil
             let f = syncStateForwardTask; syncStateForwardTask = nil
             let h = heartbeatRoutingTask; heartbeatRoutingTask = nil
             let sp = statusPushRoutingTask; statusPushRoutingTask = nil
+            let dj = driftJumpRoutingTask; driftJumpRoutingTask = nil
             let e = syncEngine
             let t = transport
             let reg = statusRegistry; statusRegistry = nil
             let rec = statusReceiver; statusReceiver = nil
             let hb = heartbeatMonitor; heartbeatMonitor = nil
-            return (c, s, f, h, sp, e, t, reg, rec, hb)
+            let sc = eventScheduler; eventScheduler = nil
+            return (c, s, f, h, sp, dj, e, t, reg, rec, hb, sc)
         }
 
         coordTask?.cancel()
@@ -238,17 +260,20 @@ public final class PeerClock: @unchecked Sendable {
         fwdTask?.cancel()
         hbTask?.cancel()
         spTask?.cancel()
+        djTask?.cancel()
 
         await coordTask?.value
         await syncResponder?.value
         await fwdTask?.value
         await hbTask?.value
         await spTask?.value
+        await djTask?.value
 
         await eng?.stop()
         await registry?.shutdown()
         await receiver?.shutdown()
         await heartbeat?.stop()
+        await sched?.shutdown()
         await tr?.stop()
 
         syncStateContinuation.yield(.idle)
@@ -300,6 +325,28 @@ public final class PeerClock: @unchecked Sendable {
     /// ハートビート接続状態遷移ストリーム。
     public var connectionEvents: AsyncStream<HeartbeatMonitor.Event> {
         lock.withLock { heartbeatMonitor }?.events ?? AsyncStream { $0.finish() }
+    }
+
+    // MARK: - EventScheduler API
+
+    /// 同期済み時刻でアクションを予約する。返されたハンドルでキャンセルと状態確認が可能。
+    /// - parameter atSyncedTime: `clock.now` と同じ時間軸のナノ秒値
+    public func schedule(
+        atSyncedTime: UInt64,
+        _ action: @Sendable @escaping () -> Void
+    ) async -> ScheduledEventHandle {
+        guard let scheduler = lock.withLock({ eventScheduler }) else {
+            // 未起動時はデッドハンドルを返す
+            let dead = EventScheduler(now: { 0 })
+            return ScheduledEventHandle(id: UUID(), scheduler: dead)
+        }
+        let id = await scheduler.schedule(atSyncedTime: atSyncedTime, action)
+        return ScheduledEventHandle(id: id, scheduler: scheduler)
+    }
+
+    /// スケジューラ通知ストリーム（クロックジャンプ警告など）。
+    public var schedulerEvents: AsyncStream<SchedulerEvent> {
+        lock.withLock { eventScheduler }?.schedulerEvents ?? AsyncStream { $0.finish() }
     }
 
     // MARK: - Private: Coordination Loop
