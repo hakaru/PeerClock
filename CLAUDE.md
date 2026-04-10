@@ -84,4 +84,4 @@ let clock = PeerClock(configuration: config, transportFactory: { peerID in
 
 - Swift 6 strict concurrency 有効。公開型は `Sendable` 準拠必須。可変状態を持つクラスは `@unchecked Sendable` + `NSLock`
 - アプリターゲット追加時に `NSLocalNetworkUsageDescription` と `NSBonjourServices: ["_peerclock._udp"]` が Info.plist に必要
-- `docs/DESIGN.md` は初期設計（master/slave）で参考情報。正の設計仕様は `docs/superpowers/specs/` の v2 spec
+- `docs/archive/DESIGN-v1.md` は初期設計（master/slave）で参考情報。正の設計仕様は `docs/superpowers/specs/` の v2 spec
