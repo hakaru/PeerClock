@@ -1,5 +1,10 @@
 # PeerClock
 
+![Swift 6.0](https://img.shields.io/badge/Swift-6.0-orange)
+![iOS 17+](https://img.shields.io/badge/iOS-17%2B-blue)
+![macOS 14+](https://img.shields.io/badge/macOS-14%2B-blue)
+![License: MIT](https://img.shields.io/badge/License-MIT-green)
+
 Peer-equal P2P clock synchronization and device coordination for Apple devices.
 
 ## What is PeerClock?
@@ -16,8 +21,11 @@ PeerClock is a Swift library that synchronizes clocks and coordinates actions ac
 | Clock sync | Yes | No | **Yes (±2ms)** |
 | Command channel | No | Data transfer only | **Generic commands** |
 | Status sharing | No | No | **Push + Pull** |
+| Event scheduling | No | No | **Synchronized precision** |
+| Heartbeat monitoring | No | No | **3-state (connected/degraded/disconnected)** |
+| Transport failover | N/A | Manual | **Automatic (WiFi → MPC)** |
 
-No existing Swift library combines peer-equal clock sync, generic commands, and status sharing.
+No existing Swift library combines peer-equal clock sync, generic commands, status sharing, event scheduling, and transport failover.
 
 ## Use Cases
 
@@ -28,6 +36,8 @@ No existing Swift library combines peer-equal clock sync, generic commands, and 
 - **Any P2P app** needing devices to agree on "now" and coordinate actions
 
 ## API
+
+### Basic — Clock Sync & Commands
 
 ```swift
 import PeerClock
@@ -55,6 +65,42 @@ for await (sender, command) in clock.commands {
 }
 ```
 
+### Status Sharing
+
+```swift
+// Publish local status (debounced, auto-broadcast)
+await clock.setStatus("recording", forKey: "app.state")
+
+// Observe remote peers' status
+for await status in clock.statusUpdates {
+    let entries = status.entries  // [String: Data]
+    // Decode app-defined values
+}
+```
+
+### Connection Health
+
+```swift
+// Monitor heartbeat-driven connection state
+for await event in clock.connectionEvents {
+    print("\(event.peerID): \(event.state)")
+    // .connected → .degraded → .disconnected
+}
+```
+
+### Precision Event Scheduling
+
+```swift
+// Schedule an action 3 seconds from now — fires on all devices ±2ms
+let fireTime = clock.now + 3_000_000_000
+let handle = try await clock.schedule(atSyncedTime: fireTime) {
+    startRecording()
+}
+
+// Cancel if needed
+await handle.cancel()
+```
+
 ## Architecture
 
 ```
@@ -62,6 +108,8 @@ PeerClock (Facade — all peers equal, no roles)
 │
 ├── Transport          Protocol: reliable + unreliable channels
 │   ├── WiFiTransport  Network.framework (UDP + TCP)
+│   ├── MultipeerTransport  MultipeerConnectivity fallback
+│   ├── FailoverTransport   Auto WiFi → MPC failover
 │   └── MockTransport  In-memory (for testing)
 │
 ├── Coordination       Auto coordinator election (smallest PeerID)
@@ -69,10 +117,21 @@ PeerClock (Facade — all peers equal, no roles)
 │
 ├── ClockSync          NTP-inspired 4-timestamp exchange
 │   ├── NTPSyncEngine  40 measurements, best-half filtering
-│   └── DriftMonitor   Jump detection (>10ms → full re-sync)
+│   ├── DriftMonitor   Jump detection (>10ms → full re-sync)
+│   └── BackoffController  Dynamic sync interval [5→30s]
 │
 ├── Command            Generic command send/broadcast
 │   └── CommandRouter  App defines semantics, PeerClock routes
+│
+├── Status             Peer status sharing
+│   ├── StatusRegistry   Local status (push with debounce)
+│   └── StatusReceiver   Remote status (generation-based dedup)
+│
+├── Heartbeat          Connection health monitoring
+│   └── HeartbeatMonitor  connected → degraded → disconnected
+│
+├── EventScheduler     Synchronized precision event firing
+│                      mach_absolute_time + sync offset
 │
 └── Wire               Binary protocol (5-byte header + payload)
     └── MessageCodec   Encode/decode, transport-agnostic
@@ -84,15 +143,15 @@ PeerClock (Facade — all peers equal, no roles)
 2. **Coordinator election** — Smallest PeerID becomes sync reference (automatic, invisible to app)
 3. **4-timestamp exchange** — NTP-inspired: `offset = ((t1-t0) + (t2-t3)) / 2`
 4. **Best-half filtering** — 40 measurements, sort by RTT, use fastest 50%
-5. **Periodic re-sync** — Every 5 seconds to correct crystal oscillator drift (20-50ppm)
-6. **Jump detection** — Offset change >10ms triggers full re-sync
+5. **Dynamic re-sync** — Backoff stages: 5s → 10s → 20s → 30s as quality stabilizes
+6. **Jump detection** — Offset change >10ms triggers full re-sync and backoff reset
 
 ### Precision Budget
 
 | Source | Error | Mitigation |
 |--------|-------|------------|
 | Wi-Fi UDP jitter | 1-10ms | Best-half filtering → ~1-2ms |
-| Crystal oscillator drift | 50ppm = 0.25ms/5s | 5s periodic re-sync |
+| Crystal oscillator drift | 50ppm = 0.25ms/5s | Periodic re-sync |
 | iOS scheduling | <1ms | `mach_continuous_time` for sub-ms timing |
 | **Total** | **±2ms typical** | |
 
@@ -111,45 +170,45 @@ dependencies: [
 ]
 ```
 
+## Testing
+
+All deterministic logic is tested via `MockTransport` (in-memory, no network needed):
+
+```swift
+let network = MockNetwork()
+let clock = PeerClock(configuration: config, transportFactory: { peerID in
+    network.createTransport(for: peerID)
+})
+```
+
+```bash
+swift test                    # 127 tests, 26 suites
+swift test --filter NTPSyncEngineTests  # single suite
+```
+
 ## Roadmap
 
-### Phase 1: Transport + ClockSync + Command ✅
+### Completed
 
-- [x] Peer-equal architecture (no master/slave)
-- [x] Transport protocol abstraction (reliable / unreliable)
-- [x] Bonjour discovery (all nodes browse + advertise)
-- [x] Coordinator auto-election (smallest PeerID)
-- [x] NTP-inspired 4-timestamp clock sync + best-half filtering
-- [x] Drift monitoring and jump detection
-- [x] Generic command channel (send / broadcast)
-- [x] Wire protocol codec (5-byte header, transport-agnostic)
-- [x] MockTransport for unit testing
-- [x] WiFiTransport (Network.framework UDP/TCP)
-- [x] PeerClock facade (role-free public API)
+- [x] **Phase 1** — Transport + ClockSync + Command + Coordinator election + Facade
+- [x] **Phase 2a** — Status registry + HeartbeatMonitor (push/pull, generation counter, debounce)
+- [x] **Phase 2b** — EventScheduler (mach_absolute_time precision firing)
+- [x] **Phase 3a** — Reconnection + coordinator re-election
+- [x] **Phase 3b** — MultipeerConnectivity transport
+- [x] **Phase 3c** — FailoverTransport (automatic WiFi → MPC)
+- [x] **Phase 3.5** — Dynamic sync interval backoff
+- [x] **Phase 3.6** — Sync guard + schedule API hardening
+- [x] **Phase 3.7** — CommandRouter hardening (stream split + command identity)
 
-### Phase 2: Status + Event Scheduling
+### Planned
 
-- [ ] Status registry (common `pc.*` + custom app-defined keys)
-- [ ] Status push (auto-broadcast on change) + pull (on-demand request)
-- [ ] Status generation counter for freshness
-- [ ] Debounce for high-frequency status updates
-- [ ] Heartbeat + connection state (connected → degraded → disconnected)
-- [ ] Event scheduler (`mach_absolute_time` precision firing)
+- [ ] **Phase 4** — Consensus-based sync, network quality-based coordinator election, acoustic sync markers, watchOS support
 
-### Phase 3: Resilience
+## Documentation
 
-- [ ] MultipeerConnectivity fallback transport (~50ms precision)
-- [ ] Automatic transport switching (Wi-Fi → MPC)
-- [ ] Reconnection logic + coordinator re-election
-- [ ] Background mode handling
-
-### Phase 4: Advanced Sync
-
-- [ ] Consensus-based sync (all-pairs measurement, median reference)
-- [ ] Network quality-based coordinator election
-- [ ] Clock quality metrics reporting
-- [ ] Acoustic sync markers (ultrasonic pulse + cross-correlation)
-- [ ] watchOS support
+- [Architecture](docs/ARCHITECTURE.md) — component design, wire protocol, sync algorithm details
+- [Changelog](CHANGELOG.md) — release history
+- [Contributing](CONTRIBUTING.md) — how to build, test, and submit changes
 
 ## Background
 
