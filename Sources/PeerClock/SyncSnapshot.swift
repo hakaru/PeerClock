@@ -1,19 +1,20 @@
 import Foundation
 
-/// PeerClock の同期状態のアトミックスナップショット。
+/// Atomic snapshot of `PeerClock`'s synchronization state.
 ///
-/// `PeerClock.currentSync` から取得する。`isSynchronized` は同期状態だけでなく
-/// 鮮度 (最終同期からの経過時間) も判定する。
+/// Obtain via `PeerClock.currentSync`. Use `isSynchronized` to check both sync
+/// state and freshness before scheduling events.
 public struct SyncSnapshot: Sendable {
-    /// 直近の同期状態
+    /// The most recent sync lifecycle state.
     public let state: SyncState
-    /// 現在のオフセット (秒、未同期時は 0)
+    /// Current clock offset in seconds (`0` when not synchronized).
     public let offset: TimeInterval
-    /// 直近の品質情報 (未同期時は nil)
+    /// Quality metrics from the last sync round, or `nil`.
     public let quality: SyncQuality?
-    /// 直近に .synced へ遷移した時刻 (CLOCK_MONOTONIC ns、未同期時は nil)
+    /// Monotonic timestamp in nanoseconds of the last `.synced` transition, or
+    /// `nil`.
     public let lastSyncedAt: UInt64?
-    /// このスナップショットを取得した時刻 (CLOCK_MONOTONIC ns)
+    /// Monotonic timestamp in nanoseconds when this snapshot was captured.
     public let capturedAt: UInt64
     /// 鮮度判定用の閾値 (Configuration.syncStaleAfter のナノ秒換算)
     private let staleAfterNs: UInt64
@@ -34,8 +35,8 @@ public struct SyncSnapshot: Sendable {
         self.staleAfterNs = staleAfterNs
     }
 
-    /// 同期済み かつ Configuration.syncStaleAfter 以内に最終同期している。
-    /// `capturedAt < lastSyncedAt` の異常時計後退ケースは false 扱い (防御コード)。
+    /// `true` when synced and the last sync is within
+    /// `Configuration.syncStaleAfter`.
     public var isSynchronized: Bool {
         guard case .synced = state, let last = lastSyncedAt else { return false }
         guard capturedAt >= last else { return false }

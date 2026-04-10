@@ -16,10 +16,10 @@ public struct Configuration: Sendable {
 
     // MARK: - Reconnect
 
-    /// Transport 層の再接続リトライ間隔。
+    /// Retry interval in seconds for transport-level reconnection attempts.
     public let reconnectRetryInterval: TimeInterval
 
-    /// Transport 層の再接続リトライ最大回数。
+    /// Maximum number of transport-level reconnection attempts.
     public let reconnectMaxAttempts: Int
 
     // MARK: - Status debounce
@@ -40,20 +40,18 @@ public struct Configuration: Sendable {
     ///   `NTPSyncEngine` no longer reads this field; it is retained for source compatibility only.
     public let syncInterval: TimeInterval
 
-    /// Backoff stages (秒)。同期成功が連続するとこの順で sync interval が延長される。
-    /// 既存の `syncInterval` は deprecated 扱い (NTPSyncEngine 内部では未使用)。
+    /// Backoff stages in seconds for sync interval progression.
     public let syncBackoffStages: [TimeInterval]
 
-    /// 各段階で次の段階へ昇格するために必要な連続成功回数。
+    /// Consecutive successful sync rounds required to advance to the next
+    /// backoff stage.
     public let syncBackoffPromoteAfter: Int
 
-    /// schedule() がガードする最小同期信頼度 (0.0..1.0)。
-    /// `quality.confidence < minSyncQuality` の場合 `qualityBelowThreshold` を throw。
-    /// 比較は厳密未満なので `==` は通過する。
+    /// Minimum sync confidence (`0.0...1.0`) required by `schedule()`.
     public let minSyncQuality: Double
 
-    /// SyncSnapshot.isSynchronized が true となる最終同期からの最大経過時間。
-    /// デフォルト 90 秒 (Phase 3.5 のバックオフ最大 30s × 2 + マージン)。
+    /// Maximum time since the last sync for `isSynchronized` to return `true`.
+    /// Default: 90 seconds.
     public let syncStaleAfter: Duration
 
     /// 内部用: syncStaleAfter のナノ秒換算
@@ -72,8 +70,10 @@ public struct Configuration: Sendable {
 
     // MARK: - MultipeerConnectivity
 
+    /// MultipeerConnectivity service type identifier.
     public var mcServiceType: String
 
+    /// Maximum number of peers for MultipeerConnectivity sessions.
     public var mcMaxPeers: Int
 
     // MARK: - Transport

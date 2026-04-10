@@ -3,49 +3,56 @@ import Foundation
 import UIKit
 #endif
 
-/// すべてのコンポーネントを統合するファサード。
-/// すべてのピアは対等であり、コーディネーターは内部で自動選出される。
+/// Facade that integrates all PeerClock components.
+///
+/// Every peer runs the same code. There are no roles. An internal coordinator
+/// is auto-elected transparently for clock synchronization.
 public final class PeerClock: @unchecked Sendable {
 
     // MARK: - Public Static
 
+    /// Library version string (SemVer).
     public static let version = "0.2.0"
 
     // MARK: - Public Properties
 
-    /// このインスタンスのローカルピアID（init 時に生成される）
+    /// Unique identifier for this peer, generated at init.
     public let localPeerID: PeerID
 
     // MARK: - Public Streams
 
-    /// 同期状態の変化を流すストリーム
+    /// Stream of synchronization state changes.
     public let syncState: AsyncStream<SyncState>
 
-    /// 既知ピアリストの変化を流すストリーム
+    /// Stream of discovered peers on the local network.
     public let peers: AsyncStream<[Peer]>
 
-    /// 受信したアプリケーションコマンドを流すストリーム
+    /// Stream of incoming application commands from remote peers.
     public var commands: AsyncStream<(PeerID, Command)> {
         commandRouter?.incomingCommands ?? AsyncStream { $0.finish() }
     }
 
     // MARK: - Computed
 
-    /// 同期オフセットを適用した現在時刻（ナノ秒）
+    /// Current synchronized time in nanoseconds.
+    ///
+    /// Applies the clock offset from the sync engine to the local monotonic
+    /// clock. Agrees across all synced peers within +/-2 ms.
     public var now: UInt64 {
         let machNow = NTPSyncEngine.now()
         let offsetNs = Int64((syncEngine?.currentOffset ?? 0.0) * 1_000_000_000)
         return UInt64(Int64(machNow) + offsetNs)
     }
 
-    /// 現在選出されている sync coordinator の PeerID。未選出時は nil。
-    /// デバッグ・可視化用途。通常のアプリロジックはこの値を気にする必要はない。
+    /// The auto-elected sync coordinator's peer ID, or `nil` if not yet elected.
+    ///
+    /// For debugging and visualization only. Application logic should not
+    /// depend on which peer is the coordinator.
     public var coordinatorID: PeerID? {
         lock.withLock { currentCoordinator }
     }
 
-    /// 現在の同期状態のアトミックスナップショット。
-    /// schedule のガードや UI 表示で使用する。
+    /// Atomic snapshot of the current synchronization state.
     public var currentSync: SyncSnapshot {
         let captured = NTPSyncEngine.now()
         return lock.withLock {
@@ -83,7 +90,8 @@ public final class PeerClock: @unchecked Sendable {
         }
     }
 
-    /// FailoverTransport 使用時のみ非 nil。現在 active な Transport の label を返す。
+    /// Label of the currently active transport when using `FailoverTransport`,
+    /// otherwise `nil`.
     public var activeTransportLabel: String? {
         let current = lock.withLock { transport }
         return (current as? FailoverTransport)?.activeLabel
@@ -136,6 +144,12 @@ public final class PeerClock: @unchecked Sendable {
 
     // MARK: - Init
 
+    /// Creates a new `PeerClock` instance.
+    ///
+    /// - Parameters:
+    ///   - configuration: Runtime parameters. Defaults to ``Configuration/default``.
+    ///   - transportFactory: Optional factory for custom or mock transports.
+    ///     When `nil`, `WiFiTransport` is used.
     public init(
         configuration: Configuration = .default,
         transportFactory: (@Sendable (PeerID) -> any Transport)? = nil
@@ -158,7 +172,9 @@ public final class PeerClock: @unchecked Sendable {
 
     // MARK: - Public API
 
-    /// ピア探索と同期を開始する
+    /// Starts peer discovery and clock synchronization.
+    ///
+    /// - Throws: Transport-level errors, such as denied network permission.
     public func start() async throws {
         let tr: any Transport = lock.withLock {
             let newTransport = transportFactory(localPeerID)
@@ -310,7 +326,7 @@ public final class PeerClock: @unchecked Sendable {
         lock.withLock { self.coordinationTask = coordTask }
     }
 
-    /// 同期を停止する
+    /// Stops synchronization and disconnects from all peers.
     public func stop() async {
         let (coordTask, syncResponder, fwdTask, hbTask, spTask, hbElecTask, djTask, eng, tr, registry, receiver, heartbeat, sched) = lock.withLock {
             let c = coordinationTask; coordinationTask = nil
@@ -359,13 +375,19 @@ public final class PeerClock: @unchecked Sendable {
         syncStateContinuation.yield(.idle)
     }
 
-    /// 指定ピアにコマンドを送信する
+    /// Sends a command to a specific peer.
+    ///
+    /// - Parameters:
+    ///   - command: The command to send.
+    ///   - peer: Target peer identifier.
     public func send(_ command: Command, to peer: PeerID) async throws {
         guard let router = lock.withLock({ commandRouter }) else { return }
         try await router.send(command, to: peer)
     }
 
-    /// 全ピアにコマンドをブロードキャストする
+    /// Broadcasts a command to all connected peers.
+    ///
+    /// - Parameter command: The command to broadcast.
     public func broadcast(_ command: Command) async throws {
         guard let router = lock.withLock({ commandRouter }) else { return }
         try await router.broadcast(command)
@@ -373,52 +395,65 @@ public final class PeerClock: @unchecked Sendable {
 
     // MARK: - Status API
 
-    /// 生バイト列のステータス値をセットする。フラッシュはデバウンスされる。
+    /// Sets a raw `Data` status value for the given key.
+    ///
+    /// - Parameters:
+    ///   - data: Raw bytes to store.
+    ///   - key: Status key. Use the `pc.*` prefix for reserved keys.
     public func setStatus(_ data: Data, forKey key: String) async {
         let registry = lock.withLock { statusRegistry }
         await registry?.setStatus(data, forKey: key)
     }
 
-    /// Codable なステータス値をセットする（binary plist エンコード）。エンコード失敗時に throw。
+    /// Sets a `Codable` status value for the given key.
+    ///
+    /// - Parameters:
+    ///   - value: The value to encode and store.
+    ///   - key: Status key.
+    /// - Throws: An encoding error if the value cannot be serialized.
     public func setStatus<T: Codable & Sendable>(_ value: T, forKey key: String) async throws {
         guard let registry = lock.withLock({ statusRegistry }) else { return }
         try await registry.setStatus(value, forKey: key)
     }
 
-    /// 指定ピアの最新ステータスを返す。
+    /// Returns the latest known status of a remote peer, or `nil` if unknown.
     public func status(of peer: PeerID) async -> RemotePeerStatus? {
         let receiver = lock.withLock { statusReceiver }
         return await receiver?.status(of: peer)
     }
 
-    /// デバウンスされたリモートステータス更新ストリーム。
+    /// Stream of debounced remote status updates.
     public var statusUpdates: AsyncStream<RemotePeerStatus> {
         lock.withLock { statusReceiver }?.updates ?? AsyncStream { $0.finish() }
     }
 
-    /// 指定ピアのハートビート由来の接続状態を返す。
+    /// Returns the heartbeat-derived connection state of a peer.
     public func connectionState(of peer: PeerID) async -> ConnectionState? {
         let hb = lock.withLock { heartbeatMonitor }
         return await hb?.currentState(of: peer)
     }
 
-    /// ハートビート接続状態遷移ストリーム。
+    /// Stream of heartbeat connection state transitions.
     public var connectionEvents: AsyncStream<HeartbeatMonitor.Event> {
         lock.withLock { heartbeatMonitor }?.events ?? AsyncStream { $0.finish() }
     }
 
     // MARK: - EventScheduler API
 
-    /// 同期済み時刻でアクションを予約する。
+    /// Schedules an action to fire at a synchronized time across all peers.
     ///
-    /// ガード順:
-    /// 1. PeerClock 未起動 → `notStarted`
-    /// 2. 未同期 or 鮮度切れ → `notSynchronized`
-    /// 3. quality < minSyncQuality → `qualityBelowThreshold`
-    /// 4. 過去時刻で遅延 > lateTolerance → `deadlineExceeded`
+    /// Guard order:
+    /// 1. `notStarted`
+    /// 2. `notSynchronized`
+    /// 3. `qualityBelowThreshold`
+    /// 4. `deadlineExceeded`
     ///
-    /// - parameter atSyncedTime: `clock.now` と同じ時間軸のナノ秒値
-    /// - parameter lateTolerance: 過去時刻 schedule で許容する遅延幅。デフォルト 0 (拒否)。
+    /// - Parameters:
+    ///   - atSyncedTime: Target fire time on the `clock.now` time axis, in nanoseconds.
+    ///   - lateTolerance: Maximum acceptable lateness. Defaults to `.zero`.
+    ///   - action: Closure to execute at the scheduled time.
+    /// - Returns: A handle to cancel or query the scheduled event.
+    /// - Throws: ``PeerClockError`` if any guard fails.
     public func schedule(
         atSyncedTime: UInt64,
         lateTolerance: Duration = .zero,
@@ -469,7 +504,7 @@ public final class PeerClock: @unchecked Sendable {
         return secNs &+ attoNs
     }
 
-    /// スケジューラ通知ストリーム（クロックジャンプ警告など）。
+    /// Stream of scheduler notifications, such as drift-jump warnings.
     public var schedulerEvents: AsyncStream<SchedulerEvent> {
         lock.withLock { eventScheduler }?.schedulerEvents ?? AsyncStream { $0.finish() }
     }

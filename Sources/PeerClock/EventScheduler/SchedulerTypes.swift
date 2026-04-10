@@ -1,31 +1,30 @@
 // Sources/PeerClock/EventScheduler/SchedulerTypes.swift
 import Foundation
 
-/// 予約イベントのライフサイクル状態。
+/// Lifecycle state of a scheduled event.
 public enum ScheduledEventState: Sendable, Equatable {
-    /// 待機中。
+    /// Waiting to fire.
     case pending
-    /// 予定通り発火 (action 実行済み)。
+    /// Fired on time (action executed).
     case fired
-    /// キャンセル済み。これが action 不実行を示す唯一のターミナル状態。
+    /// Cancelled before firing (action was not executed).
     case cancelled
-    /// 過去時刻指定または起床時遅延 tolerance 超過のため遅刻発火扱い
-    /// (action は実行された)。
+    /// Fired late due to past-time scheduling or wake-up delay (action was
+    /// executed).
     case missed
 }
 
-/// EventScheduler から流れる通知イベント。
+/// Notification events emitted by the event scheduler.
 public enum SchedulerEvent: Sendable, Equatable {
-    /// クロックジャンプ検知。eventID は予約中だったイベント。
-    /// 再照準はしないため、アプリは事後にタイムスタンプ補正等の判断に使う。
+    /// A clock-drift jump was detected while an event was pending.
     case driftWarning(eventID: UUID, oldOffsetNs: Int64, newOffsetNs: Int64)
 }
 
-/// アプリが予約後に保持するハンドル。
+/// Handle returned after scheduling an event.
 ///
-/// 内部は UUID と EventScheduler への弱参照のみ。循環参照を避けるため、
-/// 実体 (action と Task) は EventScheduler 側が強参照する。
+/// Holds a `UUID` and a weak reference to the scheduler.
 public struct ScheduledEventHandle: Sendable, Hashable {
+    /// Unique identifier for the scheduled event.
     public let id: UUID
     private let scheduler: WeakSchedulerBox
 
@@ -34,10 +33,14 @@ public struct ScheduledEventHandle: Sendable, Hashable {
         self.scheduler = WeakSchedulerBox(scheduler)
     }
 
+    /// Cancels this event.
+    ///
+    /// No-op if it has already fired or been cancelled.
     public func cancel() async {
         await scheduler.value?.cancel(id)
     }
 
+    /// Returns the current state of this event.
     public func state() async -> ScheduledEventState {
         await scheduler.value?.state(of: id) ?? .cancelled
     }

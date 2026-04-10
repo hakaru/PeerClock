@@ -1,21 +1,28 @@
 import Foundation
 
+/// Abstraction over the network transport layer.
+///
+/// Implementations include `WiFiTransport`, `MultipeerTransport`, and
+/// `MockTransport`.
 public protocol Transport: Sendable {
+    /// Starts listening and advertising on the network.
     func start() async throws
+    /// Stops all network activity and disconnects peers.
     func stop() async
+    /// Stream of currently connected peer ID sets.
     var peers: AsyncStream<Set<PeerID>> { get }
+    /// Stream of incoming raw messages from peers.
     var incomingMessages: AsyncStream<(PeerID, Data)> { get }
 
-    /// Reliable unicast.
+    /// Sends data reliably to a specific peer.
     func send(_ data: Data, to peer: PeerID) async throws
 
-    /// Reliable broadcast. Used by STATUS_PUSH and other order-sensitive traffic.
+    /// Broadcasts data reliably to all connected peers.
     func broadcast(_ data: Data) async throws
 
-    /// Unreliable broadcast. Used by HEARTBEAT.
-    /// WiFiTransport currently aliases this to `broadcast` (TCP); Phase 3 will
-    /// add a real UDP path. MockTransport may record the call separately for
-    /// tests that need to distinguish channels.
+    /// Broadcasts data via the unreliable (UDP) channel.
+    ///
+    /// The default implementation falls back to `broadcast(_:)`.
     func broadcastUnreliable(_ data: Data) async throws
 }
 

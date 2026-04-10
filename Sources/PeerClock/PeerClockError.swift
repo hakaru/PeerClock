@@ -1,16 +1,18 @@
 import Foundation
 
-/// PeerClock の公開 API がスローするエラー。
+/// Errors thrown by the `PeerClock` public API.
 public enum PeerClockError: Error, Sendable, Equatable {
-    /// PeerClock が start() されていない (eventScheduler == nil)
+    /// `start()` has not been called yet.
     case notStarted
 
-    /// 同期されていない or 鮮度が staleAfter を超過している
+    /// Clock is not synchronized or the last sync exceeds
+    /// `Configuration.syncStaleAfter`.
     case notSynchronized
 
-    /// 同期信頼度が Configuration.minSyncQuality を下回っている
+    /// Sync confidence is below `Configuration.minSyncQuality`.
     case qualityBelowThreshold(quality: Double, threshold: Double)
 
-    /// 過去時刻 schedule で遅延が lateTolerance を超過している
+    /// The requested schedule time has already passed beyond the allowed
+    /// tolerance.
     case deadlineExceeded(lateBy: Duration, tolerance: Duration)
 }
