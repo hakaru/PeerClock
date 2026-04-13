@@ -309,9 +309,22 @@ public final class PeerClock: @unchecked Sendable {
         lock.withLock { self.syncStateForwardTask = forwardTask }
 
         // デバイス名を一度だけ配信
+        // iOS 16+ では UIDevice.current.name は "iPhone" を返すため、
+        // モデル識別子（例: "iPhone16,1"）から人間可読なモデル名を導出する
         let deviceName: String = {
             #if canImport(UIKit)
-            return UIDevice.current.name
+            var systemInfo = utsname()
+            uname(&systemInfo)
+            let machine = withUnsafePointer(to: &systemInfo.machine) {
+                $0.withMemoryRebound(to: CChar.self, capacity: 1) {
+                    String(cString: $0)
+                }
+            }
+            // シミュレータ判定
+            if machine == "x86_64" || machine == "arm64" {
+                return UIDevice.current.name
+            }
+            return machine  // 例: "iPhone16,1", "iPad14,2"
             #else
             return Host.current().localizedName ?? "Mac"
             #endif
