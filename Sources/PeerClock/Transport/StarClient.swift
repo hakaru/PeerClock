@@ -26,6 +26,7 @@ public final class StarClient: @unchecked Sendable {
     private var connection: NWConnection?
     private let lock = NSLock()
     private var currentState: ClientState = .idle
+    private var expectedAccept: String?
     private let connectionQueue = DispatchQueue(label: "net.hakaru.PeerClock.StarClient")
 
     public init() {
@@ -94,6 +95,8 @@ public final class StarClient: @unchecked Sendable {
             fatalError("SecRandomCopyBytes failed: \(status)")
         }
         let keyB64 = Data(key).base64EncodedString()
+        self.expectedAccept = WebSocketHandshake.computeAccept(clientKey: keyB64)
+
         let request = """
         GET / HTTP/1.1\r
         Host: peerclock\r
@@ -126,6 +129,11 @@ public final class StarClient: @unchecked Sendable {
                 if let end = buffer.range(of: Data("\r\n\r\n".utf8)) {
                     let headers = String(data: buffer[..<end.lowerBound], encoding: .utf8) ?? ""
                     if headers.contains("101 Switching Protocols") {
+                        let accept = WebSocketHandshake.extractAccept(from: headers)
+                        guard accept == self?.expectedAccept else {
+                            self?.updateState(.closed("handshake accept mismatch: expected \(self?.expectedAccept ?? "nil"), got \(accept ?? "nil")"))
+                            return
+                        }
                         self?.updateState(.ready)
                         let leftover = buffer[end.upperBound...]
                         self?.startFrameLoop(connection: connection, initial: Data(leftover))

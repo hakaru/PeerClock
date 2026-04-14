@@ -212,10 +212,28 @@ final class ClientSession: @unchecked Sendable {
     }
 
     private func sendHandshakeResponse(request: String) {
-        // Minimal 101 response — Sec-WebSocket-Accept will be added in Task 10 (Lesson #5)
-        let response = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+        guard let key = WebSocketHandshake.extractKey(from: request) else {
+            sendHandshakeError(reason: "missing Sec-WebSocket-Key")
+            return
+        }
+        let accept = WebSocketHandshake.computeAccept(clientKey: key)
+        let response = """
+        HTTP/1.1 101 Switching Protocols\r
+        Upgrade: websocket\r
+        Connection: Upgrade\r
+        Sec-WebSocket-Accept: \(accept)\r
+        \r
+
+        """
         connection.send(content: Data(response.utf8), completion: .contentProcessed { [weak self] _ in
             self?.onHandshakeComplete?()
+        })
+    }
+
+    private func sendHandshakeError(reason: String) {
+        let response = "HTTP/1.1 400 Bad Request\r\n\r\n\(reason)"
+        connection.send(content: Data(response.utf8), completion: .contentProcessed { [weak self] _ in
+            self?.connection.cancel()
         })
     }
 
