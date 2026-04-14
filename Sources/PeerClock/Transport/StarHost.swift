@@ -25,6 +25,9 @@ public final class StarHost: @unchecked Sendable {
     // Serial queue for NWListener callbacks (Lesson #1)
     private let listenerQueue = DispatchQueue(label: "net.hakaru.PeerClock.StarHost.listener")
 
+    /// Task 12: 1Hz monitor to detect and disconnect slow clients
+    private var backpressureMonitor: Task<Void, Never>?
+
     public init() {
         var cc: AsyncStream<[ClientConnection]>.Continuation!
         self.clients = AsyncStream { cc = $0 }
@@ -52,10 +55,16 @@ public final class StarHost: @unchecked Sendable {
         l.start(queue: listenerQueue)
 
         lock.withLock { listener = l }
+
+        startBackpressureMonitor()
+
         return l
     }
 
     public func stop() {
+        backpressureMonitor?.cancel()
+        backpressureMonitor = nil
+
         let l = lock.withLock { () -> NWListener? in
             let captured = listener
             listener = nil
@@ -70,6 +79,7 @@ public final class StarHost: @unchecked Sendable {
             return all
         }
         for session in snapshot {
+            session.cancelSendLoop()
             session.connection.cancel()
         }
 
@@ -81,22 +91,30 @@ public final class StarHost: @unchecked Sendable {
         messagesContinuation.finish()
     }
 
-    /// Broadcast a binary payload to all clients (independently, best-effort).
+    /// Broadcast a binary payload to all clients with default (.control) priority.
     public func broadcast(_ data: Data) {
-        let frame = WebSocketFrame.encode(binary: data, masked: false)
+        Task { await self.broadcast(data, priority: .control) }
+    }
+
+    /// Broadcast a binary payload to all clients with explicit priority (Task 11).
+    public func broadcast(_ data: Data, priority: MessageDispatcher.Priority) async {
         // Snapshot inside lock before iterating (Lesson #2)
         let snapshot = lock.withLock { Array(sessions.values) }
         for session in snapshot {
-            session.send(frame)
+            await session.enqueue(data, priority: priority)
         }
     }
 
-    /// Unicast to a specific client.
+    /// Unicast to a specific client with default (.control) priority.
     public func send(_ data: Data, to clientID: UUID) {
-        let frame = WebSocketFrame.encode(binary: data, masked: false)
+        Task { await self.send(data, to: clientID, priority: .control) }
+    }
+
+    /// Unicast to a specific client with explicit priority (Task 11).
+    public func send(_ data: Data, to clientID: UUID, priority: MessageDispatcher.Priority) async {
         // Snapshot inside lock (Lesson #2)
         let session = lock.withLock { sessions[clientID] }
-        session?.send(frame)
+        await session?.enqueue(data, priority: priority)
     }
 
     private func accept(_ connection: NWConnection) {
@@ -104,7 +122,9 @@ public final class StarHost: @unchecked Sendable {
         let session = ClientSession(id: sessionID, connection: connection)
 
         session.onHandshakeComplete = { [weak self] in
-            self?.publishClients()
+            guard let self else { return }
+            self.publishClients()
+            session.startSendLoop()
             session.startFrameLoop { [weak self] data in
                 self?.messagesContinuation.yield((clientID: sessionID, data: data))
             } onClose: { [weak self] in
@@ -119,7 +139,8 @@ public final class StarHost: @unchecked Sendable {
     }
 
     private func removeSession(_ id: UUID) {
-        lock.withLock { sessions.removeValue(forKey: id) }
+        let session = lock.withLock { sessions.removeValue(forKey: id) }
+        session?.cancelSendLoop()
         publishClients()
     }
 
@@ -129,6 +150,24 @@ public final class StarHost: @unchecked Sendable {
             sessions.values.map { ClientConnection(id: $0.id, peerID: $0.assignedPeerID) }
         }
         clientsContinuation.yield(list)
+    }
+
+    /// Task 12: Monitor slow clients at 1Hz and disconnect them.
+    private func startBackpressureMonitor() {
+        backpressureMonitor = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard let self, !Task.isCancelled else { break }
+                let sessions = self.lock.withLock { Array(self.sessions.values) }
+                for session in sessions {
+                    if await session.dispatcher.isSlowClient() {
+                        logger.warning("[StarHost] slow client \(session.id) — disconnecting")
+                        session.connection.cancel()
+                        self.removeSession(session.id)
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - Test-only accessors
@@ -146,6 +185,12 @@ final class ClientSession: @unchecked Sendable {
     private(set) var assignedPeerID: PeerID?
     var onHandshakeComplete: (() -> Void)?
 
+    /// Task 11: Per-client priority dispatcher (unified Task 11+12 design)
+    let dispatcher = MessageDispatcher()
+
+    /// Task 11: Send loop task driven by the dispatcher
+    private var sendLoopTask: Task<Void, Never>?
+
     private var buffer = Data()
     private var onConnectionLost: (() -> Void)?
     // Serial queue per session (Lesson #1) — includes id prefix for diagnostics (N-2)
@@ -160,6 +205,43 @@ final class ClientSession: @unchecked Sendable {
     func setAssignedPeerID(_ peerID: PeerID) {
         sessionQueue.async { [weak self] in
             self?.assignedPeerID = peerID
+        }
+    }
+
+    /// Task 11: Enqueue data for prioritized send.
+    /// Wraps raw data in a WebSocket frame and delivers to dispatcher.
+    func enqueue(_ data: Data, priority: MessageDispatcher.Priority) async {
+        let frame = WebSocketFrame.encode(binary: data, masked: false)
+        await dispatcher.enqueue(.init(data: frame, priority: priority))
+    }
+
+    /// Task 11: Start the send loop after handshake completes.
+    /// Polls dispatcher and writes frames to the NWConnection.
+    func startSendLoop() {
+        sendLoopTask = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                if let msg = await self.dispatcher.dequeue() {
+                    await self.sendFrame(msg.data)
+                } else {
+                    try? await Task.sleep(for: .milliseconds(10))
+                }
+            }
+        }
+    }
+
+    func cancelSendLoop() {
+        sendLoopTask?.cancel()
+        sendLoopTask = nil
+    }
+
+    private func sendFrame(_ frame: Data) async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            connection.send(content: frame, completion: .contentProcessed { [weak self] error in
+                if let error, let self {
+                    logger.error("[ClientSession \(self.id)] send failed: \(error.localizedDescription, privacy: .public)")
+                }
+                cont.resume()
+            })
         }
     }
 
@@ -286,10 +368,12 @@ final class ClientSession: @unchecked Sendable {
         loop()
     }
 
+    /// Legacy direct send — kept for ping/pong responses inside frame loop.
+    /// External callers should use enqueue(_:priority:) instead.
     func send(_ frame: Data) {
-        connection.send(content: frame, completion: .contentProcessed { error in
-            if let error {
-                logger.error("[ClientSession] send failed: \(error.localizedDescription, privacy: .public)")
+        connection.send(content: frame, completion: .contentProcessed { [weak self] error in
+            if let error, let self {
+                logger.error("[ClientSession \(self.id)] send failed: \(error.localizedDescription, privacy: .public)")
             }
         })
     }
