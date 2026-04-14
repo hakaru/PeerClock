@@ -99,34 +99,58 @@ public final class StarTransport: Transport, @unchecked Sendable {
     }
 
     public func send(_ data: Data, to peer: PeerID) async throws {
-        // TODO(Plan B): resolve peerID → clientID via peerID→clientID map.
-        // For Plan A, host broadcasts to all clients as a temporary measure.
-        let role = lock.withLock { currentRole }
-        switch role {
-        case .host:
-            let h = lock.withLock { host }
-            h?.broadcast(data)
-        case .client:
-            let c = lock.withLock { client }
-            c?.send(data)
-        case .undecided:
+        let target: SendTarget = lock.withLock { () -> SendTarget in
+            switch currentRole {
+            case .host:
+                return .host(self.host)
+            case .client:
+                return .client(self.client)
+            case .undecided:
+                return .none
+            }
+        }
+        switch target {
+        case .host(let h):
+            guard let h else { throw StarTransportError.notStarted }
+            // TODO(Plan B): resolve peerID → clientID for true unicast.
+            // For Plan A, host-mode send falls back to broadcast.
+            h.broadcast(data)
+        case .client(let c):
+            guard let c else { throw StarTransportError.notStarted }
+            c.send(data)
+        case .none:
             throw StarTransportError.notStarted
         }
     }
 
     public func broadcast(_ data: Data) async throws {
-        let role = lock.withLock { currentRole }
-        switch role {
-        case .host:
-            let h = lock.withLock { host }
-            h?.broadcast(data)
-        case .client:
+        let target: SendTarget = lock.withLock { () -> SendTarget in
+            switch currentRole {
+            case .host:
+                return .host(self.host)
+            case .client:
+                return .client(self.client)
+            case .undecided:
+                return .none
+            }
+        }
+        switch target {
+        case .host(let h):
+            guard let h else { throw StarTransportError.notStarted }
+            h.broadcast(data)
+        case .client(let c):
+            guard let c else { throw StarTransportError.notStarted }
             // Client has a single upstream connection; send to host
-            let c = lock.withLock { client }
-            c?.send(data)
-        case .undecided:
+            c.send(data)
+        case .none:
             throw StarTransportError.notStarted
         }
+    }
+
+    private enum SendTarget {
+        case host(StarHost?)
+        case client(StarClient?)
+        case none
     }
 
     // MARK: - Role promotion APIs (used by HostElection in Plan B)
@@ -134,18 +158,33 @@ public final class StarTransport: Transport, @unchecked Sendable {
     /// Promotes this node to host: starts a StarHost NWListener and begins
     /// forwarding events into the `peers` and `incomingMessages` streams.
     public func promoteToHost() async throws {
+        // Cleanup previous role first
+        let (oldHost, oldClient, oldHostTask, oldClientTask) = lock.withLock { () -> (StarHost?, StarClient?, Task<Void, Never>?, Task<Void, Never>?) in
+            let h = host
+            let c = client
+            let ht = hostForwardTask
+            let ct = clientForwardTask
+            host = nil
+            client = nil
+            hostForwardTask = nil
+            clientForwardTask = nil
+            return (h, c, ht, ct)
+        }
+        oldHostTask?.cancel()
+        oldClientTask?.cancel()
+        oldHost?.stop()
+        oldClient?.close()
+
+        // Now promote
         let h = StarHost()
         _ = try h.start()
-
-        let forwardTask = Task { [weak self] in
-            guard let self else { return }
-            await self.forwardHostEvents(from: h)
+        let forwardTask = Task<Void, Never> { [weak self] in
+            await self?.forwardHostEvents(from: h)
         }
-
         lock.withLock {
-            host = h
-            currentRole = .host
-            hostForwardTask = forwardTask
+            self.host = h
+            self.currentRole = .host
+            self.hostForwardTask = forwardTask
         }
 
         logger.info("[StarTransport] promoted to host (localPeerID=\(self.localPeerID.description, privacy: .public))")
@@ -153,18 +192,33 @@ public final class StarTransport: Transport, @unchecked Sendable {
 
     /// Demotes this node to client, connecting to the given endpoint.
     public func demoteToClient(connectingTo endpoint: NWEndpoint, hostPeerID: PeerID) async {
+        // Cleanup previous role first
+        let (oldHost, oldClient, oldHostTask, oldClientTask) = lock.withLock { () -> (StarHost?, StarClient?, Task<Void, Never>?, Task<Void, Never>?) in
+            let h = host
+            let c = client
+            let ht = hostForwardTask
+            let ct = clientForwardTask
+            host = nil
+            client = nil
+            hostForwardTask = nil
+            clientForwardTask = nil
+            return (h, c, ht, ct)
+        }
+        oldHostTask?.cancel()
+        oldClientTask?.cancel()
+        oldHost?.stop()
+        oldClient?.close()
+
+        // Now demote
         let c = StarClient()
         c.connect(to: endpoint)
-
-        let forwardTask = Task { [weak self] in
-            guard let self else { return }
-            await self.forwardClientEvents(from: c, hostPeerID: hostPeerID)
+        let forwardTask = Task<Void, Never> { [weak self] in
+            await self?.forwardClientEvents(from: c, hostPeerID: hostPeerID)
         }
-
         lock.withLock {
-            client = c
-            currentRole = .client(hostPeerID: hostPeerID)
-            clientForwardTask = forwardTask
+            self.client = c
+            self.currentRole = .client(hostPeerID: hostPeerID)
+            self.clientForwardTask = forwardTask
         }
 
         logger.info("[StarTransport] demoted to client of \(hostPeerID.description, privacy: .public)")
@@ -175,51 +229,52 @@ public final class StarTransport: Transport, @unchecked Sendable {
     /// Consumes `StarHost.clients` and `StarHost.incomingMessages`, translating
     /// them into the Transport-protocol streams.
     private func forwardHostEvents(from h: StarHost) async {
-        // Forward peer list changes
-        let clientListTask = Task { [weak self] in
-            guard let self else { return }
-            for await clients in h.clients {
-                // Snapshot: emit PeerIDs of clients that have a known peerID
-                let peerSet = Set(clients.compactMap(\.peerID))
-                self.peersContinuation.yield(peerSet)
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { [weak self] in
+                for await clients in h.clients {
+                    // Snapshot: emit PeerIDs of clients that have a known peerID
+                    let peerSet = Set(clients.compactMap(\.peerID))
+                    self?.peersContinuation.yield(peerSet)
+                }
             }
+            group.addTask { [weak self] in
+                // Forward incoming messages — use a placeholder PeerID for unmapped clients (Plan B TODO)
+                for await (clientID, data) in h.incomingMessages {
+                    // TODO(Plan B): resolve clientID → PeerID via peerID→clientID map.
+                    // For Plan A, fabricate a PeerID from the clientID bytes to preserve uniqueness.
+                    let placeholder = PeerID(clientID)
+                    self?.incomingContinuation.yield((placeholder, data))
+                }
+            }
+            await group.waitForAll()
         }
-
-        // Forward incoming messages — use a placeholder PeerID for unmapped clients (Plan B TODO)
-        for await (clientID, data) in h.incomingMessages {
-            // TODO(Plan B): resolve clientID → PeerID via peerID→clientID map.
-            // For Plan A, fabricate a PeerID from the clientID bytes to preserve uniqueness.
-            let placeholder = PeerID(clientID)
-            incomingContinuation.yield((placeholder, data))
-        }
-
-        clientListTask.cancel()
     }
 
     /// Consumes `StarClient.incomingMessages` and `StarClient.stateStream`,
     /// translating them into the Transport-protocol streams.
     private func forwardClientEvents(from c: StarClient, hostPeerID: PeerID) async {
-        // Forward state changes → peers stream
-        let stateTask = Task { [weak self] in
-            guard let self else { return }
-            for await state in c.stateStream {
-                switch state {
-                case .ready:
-                    self.peersContinuation.yield([hostPeerID])
-                case .closed:
-                    self.peersContinuation.yield([])
-                default:
-                    break
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { [weak self] in
+                // Forward state changes → peers stream
+                for await state in c.stateStream {
+                    switch state {
+                    case .ready:
+                        self?.peersContinuation.yield([hostPeerID])
+                    case .closed:
+                        self?.peersContinuation.yield([])
+                    default:
+                        break
+                    }
                 }
             }
+            group.addTask { [weak self] in
+                // Forward incoming messages from host
+                for await data in c.incomingMessages {
+                    self?.incomingContinuation.yield((hostPeerID, data))
+                }
+            }
+            await group.waitForAll()
         }
-
-        // Forward incoming messages from host
-        for await data in c.incomingMessages {
-            incomingContinuation.yield((hostPeerID, data))
-        }
-
-        stateTask.cancel()
     }
 
     // MARK: - Test-only accessors
