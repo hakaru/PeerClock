@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import os
+import Security
 
 private let logger = Logger(subsystem: "net.hakaru.PeerClock", category: "StarClient")
 
@@ -25,6 +26,7 @@ public final class StarClient: @unchecked Sendable {
     private var connection: NWConnection?
     private let lock = NSLock()
     private var currentState: ClientState = .idle
+    private let connectionQueue = DispatchQueue(label: "net.hakaru.PeerClock.StarClient")
 
     public init() {
         var ic: AsyncStream<Data>.Continuation!
@@ -44,7 +46,7 @@ public final class StarClient: @unchecked Sendable {
         conn.stateUpdateHandler = { [weak self] state in
             self?.handleConnectionState(state, connection: conn)
         }
-        conn.start(queue: .global(qos: .userInitiated))
+        conn.start(queue: connectionQueue)
 
         lock.withLock { connection = conn }
         updateState(.connecting)
@@ -52,7 +54,8 @@ public final class StarClient: @unchecked Sendable {
 
     public func send(_ data: Data) {
         let frame = WebSocketFrame.encode(binary: data, masked: true)
-        connection?.send(content: frame, completion: .contentProcessed { error in
+        let conn = lock.withLock { connection }
+        conn?.send(content: frame, completion: .contentProcessed { error in
             if let error {
                 logger.error("[StarClient] send failed: \(error.localizedDescription, privacy: .public)")
             }
@@ -60,8 +63,12 @@ public final class StarClient: @unchecked Sendable {
     }
 
     public func close() {
-        connection?.cancel()
-        lock.withLock { connection = nil }
+        let conn = lock.withLock { () -> NWConnection? in
+            let c = connection
+            connection = nil
+            return c
+        }
+        conn?.cancel()
         updateState(.closed("user requested"))
     }
 
@@ -81,7 +88,11 @@ public final class StarClient: @unchecked Sendable {
 
     private func performHandshake(connection: NWConnection) {
         updateState(.handshaking)
-        let key = (0..<16).map { _ in UInt8.random(in: 0...255) }
+        var key = [UInt8](repeating: 0, count: 16)
+        let status = SecRandomCopyBytes(kSecRandomDefault, 16, &key)
+        guard status == errSecSuccess else {
+            fatalError("SecRandomCopyBytes failed: \(status)")
+        }
         let keyB64 = Data(key).base64EncodedString()
         let request = """
         GET / HTTP/1.1\r
@@ -104,7 +115,7 @@ public final class StarClient: @unchecked Sendable {
 
     private func receiveHandshakeResponse(connection: NWConnection) {
         var buffer = Data()
-        func read() {
+        func readMore() {
             connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, _, error in
                 if let error {
                     self?.updateState(.closed("handshake recv failed: \(error)"))
@@ -122,11 +133,11 @@ public final class StarClient: @unchecked Sendable {
                         self?.updateState(.closed("handshake rejected: \(headers)"))
                     }
                 } else {
-                    read()
+                    readMore()
                 }
             }
         }
-        read()
+        readMore()
     }
 
     private func startFrameLoop(connection: NWConnection, initial: Data) {
@@ -173,5 +184,9 @@ public final class StarClient: @unchecked Sendable {
     private func updateState(_ new: ClientState) {
         lock.withLock { currentState = new }
         stateContinuation.yield(new)
+        if case .closed = new {
+            incomingContinuation.finish()
+            stateContinuation.finish()
+        }
     }
 }
