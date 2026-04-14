@@ -130,6 +130,12 @@ public final class StarHost: @unchecked Sendable {
         }
         clientsContinuation.yield(list)
     }
+
+    // MARK: - Test-only accessors
+
+    #if DEBUG
+    internal var listenerForTest: NWListener? { lock.withLock { listener } }
+    #endif
 }
 
 // MARK: - ClientSession (private)
