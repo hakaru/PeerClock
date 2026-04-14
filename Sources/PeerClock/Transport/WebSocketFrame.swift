@@ -15,6 +15,9 @@ public enum WebSocketFrame: Equatable {
         case invalidUTF8
         case unsupportedOpcode(UInt8)
         case fragmentationNotSupported
+        case payloadTooLarge
+        case reservedBitsSet
+        case controlFrameTooLarge
     }
 
     /// Encode a text frame. Clients must set masked=true (RFC 6455 §5.3).
@@ -31,14 +34,17 @@ public enum WebSocketFrame: Equatable {
         payload.append(UInt8(code >> 8))
         payload.append(UInt8(code & 0xFF))
         payload.append(Data(reason.utf8))
+        precondition(payload.count <= 125, "Control frame payload must not exceed 125 bytes (RFC 6455 §5.5)")
         return encode(opcode: 0x8, payload: payload, masked: masked)
     }
 
     public static func encodePing(_ payload: Data = Data(), masked: Bool) -> Data {
+        precondition(payload.count <= 125, "Control frame payload must not exceed 125 bytes (RFC 6455 §5.5)")
         return encode(opcode: 0x9, payload: payload, masked: masked)
     }
 
     public static func encodePong(_ payload: Data, masked: Bool) -> Data {
+        precondition(payload.count <= 125, "Control frame payload must not exceed 125 bytes (RFC 6455 §5.5)")
         return encode(opcode: 0xA, payload: payload, masked: masked)
     }
 
@@ -64,9 +70,16 @@ public enum WebSocketFrame: Equatable {
 
         if masked {
             var key = [UInt8](repeating: 0, count: 4)
-            _ = SecRandomCopyBytes(kSecRandomDefault, 4, &key)
+            let status = SecRandomCopyBytes(kSecRandomDefault, 4, &key)
+            guard status == errSecSuccess else {
+                fatalError("SecRandomCopyBytes failed: \(status)")
+            }
             out.append(contentsOf: key)
-            let maskedPayload = zip(payload, (0..<payload.count).map { key[$0 % 4] }).map { $0 ^ $1 }
+            var maskedPayload = [UInt8]()
+            maskedPayload.reserveCapacity(payload.count)
+            for (i, byte) in payload.enumerated() {
+                maskedPayload.append(byte ^ key[i & 3])
+            }
             out.append(contentsOf: maskedPayload)
         } else {
             out.append(payload)
@@ -88,6 +101,11 @@ public enum WebSocketFrame: Equatable {
 
         guard fin else { throw DecodeError.fragmentationNotSupported }
 
+        let rsv = byte0 & 0x70
+        guard rsv == 0 else {
+            throw DecodeError.reservedBitsSet
+        }
+
         let masked = (byte1 & 0x80) != 0
         let payloadLenByte = byte1 & 0x7F
 
@@ -106,11 +124,21 @@ public enum WebSocketFrame: Equatable {
             for i in 0..<8 {
                 len = (len << 8) | UInt64(data[data.startIndex + offset + i])
             }
+            guard len <= UInt64(Int.max) else {
+                throw DecodeError.payloadTooLarge
+            }
             payloadLen = Int(len)
             offset += 8
         }
 
-        var maskKey: [UInt8]? = nil
+        // Control frames must not exceed 125 bytes (RFC 6455 §5.5)
+        if opcode == 0x8 || opcode == 0x9 || opcode == 0xA {
+            guard payloadLen <= 125 else {
+                throw DecodeError.controlFrameTooLarge
+            }
+        }
+
+        var maskKey: [UInt8]?
         if masked {
             guard data.count >= offset + 4 else { return nil }
             maskKey = (0..<4).map { data[data.startIndex + offset + $0] }
@@ -122,7 +150,12 @@ public enum WebSocketFrame: Equatable {
         let rawPayload = data.subdata(in: (data.startIndex + offset)..<(data.startIndex + offset + payloadLen))
         let payload: Data
         if let key = maskKey {
-            payload = Data(zip(rawPayload, (0..<rawPayload.count).map { key[$0 % 4] }).map { $0 ^ $1 })
+            var unmasked = [UInt8]()
+            unmasked.reserveCapacity(rawPayload.count)
+            for (i, byte) in rawPayload.enumerated() {
+                unmasked.append(byte ^ key[i & 3])
+            }
+            payload = Data(unmasked)
         } else {
             payload = rawPayload
         }
