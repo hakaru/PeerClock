@@ -2,6 +2,12 @@ import Foundation
 
 /// Control-plane messages exchanged between host and clients over WebSocket.
 /// Uses `type` discriminator for tagged-union JSON encoding.
+///
+/// **Wire boundary note:**
+/// These messages are JSON-encoded and transmitted over the WebSocket-based
+/// `StarTransport` introduced in v0.3. They are **not** compatible with the
+/// binary `Message` type in `Wire/Message.swift`, which belongs exclusively to
+/// the legacy `MultipeerTransport` protocol. Do not mix the two on the same wire.
 public enum ControlMessage: Codable, Equatable, Sendable {
     case sessionInit(
         sessionID: UUID,
@@ -24,6 +30,8 @@ public enum ControlMessage: Codable, Equatable, Sendable {
         commandVersion: UInt64
     )
     case heartbeat(hostTimeNs: UInt64, term: UInt64)
+    // TODO(v0.3): consider strongly-typed enums for `state` and `preset`
+    // once the consuming layers are wired up.
     case status(
         peerID: PeerID,
         state: String,
@@ -41,24 +49,24 @@ public enum ControlMessage: Codable, Equatable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case .sessionInit(let s, let t, let g, let h, let b):
+        case .sessionInit(let sessionID, let term, let sessionGeneration, let hostPeerID, let timeBaseNs):
             try container.encode("session_init", forKey: .type)
-            try container.encode(SessionInitPayload(sessionID: s, term: t, sessionGeneration: g, hostPeerID: h, timeBaseNs: b), forKey: .payload)
-        case .startRecording(let t, let p, let s, let c, let v):
+            try container.encode(SessionInitPayload(sessionID: sessionID, term: term, sessionGeneration: sessionGeneration, hostPeerID: hostPeerID, timeBaseNs: timeBaseNs), forKey: .payload)
+        case .startRecording(let targetTimeNs, let preset, let sessionID, let commandID, let commandVersion):
             try container.encode("start_recording", forKey: .type)
-            try container.encode(StartRecordingPayload(targetTimeNs: t, preset: p, sessionID: s, commandID: c, commandVersion: v), forKey: .payload)
-        case .stopRecording(let t, let s, let c, let v):
+            try container.encode(StartRecordingPayload(targetTimeNs: targetTimeNs, preset: preset, sessionID: sessionID, commandID: commandID, commandVersion: commandVersion), forKey: .payload)
+        case .stopRecording(let atTimeNs, let sessionID, let commandID, let commandVersion):
             try container.encode("stop_recording", forKey: .type)
-            try container.encode(StopRecordingPayload(atTimeNs: t, sessionID: s, commandID: c, commandVersion: v), forKey: .payload)
-        case .heartbeat(let t, let term):
+            try container.encode(StopRecordingPayload(atTimeNs: atTimeNs, sessionID: sessionID, commandID: commandID, commandVersion: commandVersion), forKey: .payload)
+        case .heartbeat(let hostTimeNs, let term):
             try container.encode("heartbeat", forKey: .type)
-            try container.encode(HeartbeatPayload(hostTimeNs: t, term: term), forKey: .payload)
-        case .status(let p, let state, let e, let preset):
+            try container.encode(HeartbeatPayload(hostTimeNs: hostTimeNs, term: term), forKey: .payload)
+        case .status(let peerID, let state, let elapsedSeconds, let preset):
             try container.encode("status", forKey: .type)
-            try container.encode(StatusPayload(peerID: p, state: state, elapsedSeconds: e, preset: preset), forKey: .payload)
-        case .recordingAck(let s, let p, let l):
+            try container.encode(StatusPayload(peerID: peerID, state: state, elapsedSeconds: elapsedSeconds, preset: preset), forKey: .payload)
+        case .recordingAck(let sessionID, let peerID, let localStartNs):
             try container.encode("recording_ack", forKey: .type)
-            try container.encode(RecordingAckPayload(sessionID: s, peerID: p, localStartNs: l), forKey: .payload)
+            try container.encode(RecordingAckPayload(sessionID: sessionID, peerID: peerID, localStartNs: localStartNs), forKey: .payload)
         }
     }
 
@@ -91,37 +99,37 @@ public enum ControlMessage: Codable, Equatable, Sendable {
 }
 
 // Payload structs (private)
-private struct SessionInitPayload: Codable, Equatable {
+private struct SessionInitPayload: Codable {
     let sessionID: UUID
     let term: UInt64
     let sessionGeneration: UInt64
     let hostPeerID: PeerID
     let timeBaseNs: UInt64
 }
-private struct StartRecordingPayload: Codable, Equatable {
+private struct StartRecordingPayload: Codable {
     let targetTimeNs: UInt64
     let preset: String
     let sessionID: UUID
     let commandID: UUID
     let commandVersion: UInt64
 }
-private struct StopRecordingPayload: Codable, Equatable {
+private struct StopRecordingPayload: Codable {
     let atTimeNs: UInt64
     let sessionID: UUID
     let commandID: UUID
     let commandVersion: UInt64
 }
-private struct HeartbeatPayload: Codable, Equatable {
+private struct HeartbeatPayload: Codable {
     let hostTimeNs: UInt64
     let term: UInt64
 }
-private struct StatusPayload: Codable, Equatable {
+private struct StatusPayload: Codable {
     let peerID: PeerID
     let state: String
     let elapsedSeconds: Int?
     let preset: String?
 }
-private struct RecordingAckPayload: Codable, Equatable {
+private struct RecordingAckPayload: Codable {
     let sessionID: UUID
     let peerID: PeerID
     let localStartNs: UInt64
