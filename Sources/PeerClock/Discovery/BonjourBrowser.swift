@@ -22,7 +22,7 @@ public final class BonjourBrowser: @unchecked Sendable {
 
     private var browser: NWBrowser?
     private var current: [String: DiscoveredPeer] = [:]
-    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "net.hakaru.PeerClock.BonjourBrowser")
 
     public init() {
         var c: AsyncStream<[DiscoveredPeer]>.Continuation!
@@ -30,7 +30,7 @@ public final class BonjourBrowser: @unchecked Sendable {
         self.peersContinuation = c
     }
 
-    public func start(serviceType: String = "_1take-sync._tcp") {
+    public func start(serviceType: String = PeerClockService.type) {
         let params = NWParameters.tcp
         params.includePeerToPeer = true
         let descriptor = NWBrowser.Descriptor.bonjour(type: serviceType, domain: nil)
@@ -42,18 +42,24 @@ public final class BonjourBrowser: @unchecked Sendable {
         b.stateUpdateHandler = { state in
             logger.info("[Browser] state=\(String(describing: state), privacy: .public)")
         }
-        b.start(queue: .global(qos: .userInitiated))
+        b.start(queue: queue)
         self.browser = b
         logger.info("[Browser] started for \(serviceType, privacy: .public)")
     }
 
     public func stop() {
-        browser?.cancel()
-        browser = nil
-        lock.withLock { current.removeAll() }
-        peersContinuation.yield([])
+        queue.async { [self] in
+            browser?.cancel()
+            browser = nil
+            current.removeAll()
+            peersContinuation.yield([])
+            peersContinuation.finish()
+        }
     }
 
+    // Note: We use the full results snapshot rather than `changes` deltas.
+    // For 10-device scale this is simpler and correct; if peer counts grow
+    // larger, switch to processing changes (.added/.removed/.changed).
     private func handleResults(_ results: Set<NWBrowser.Result>) {
         var next: [String: DiscoveredPeer] = [:]
         for result in results {
@@ -69,7 +75,7 @@ public final class BonjourBrowser: @unchecked Sendable {
                 txt: txt
             )
         }
-        lock.withLock { current = next }
+        current = next
         peersContinuation.yield(Array(next.values))
     }
 }

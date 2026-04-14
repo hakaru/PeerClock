@@ -22,14 +22,14 @@ public final class BonjourAdvertiser: @unchecked Sendable {
             self.version = version
         }
 
-        func asDictionary() -> [String: String] {
-            return [
-                "role": role,
-                "peer_id": peerID,
-                "term": String(term),
-                "score": scoreBase64,
-                "version": String(version)
-            ]
+        func asNWTXTRecord() -> NWTXTRecord {
+            var record = NWTXTRecord()
+            record["role"] = role
+            record["peer_id"] = peerID
+            record["term"] = String(term)
+            record["score"] = scoreBase64
+            record["version"] = String(version)
+            return record
         }
     }
 
@@ -37,7 +37,7 @@ public final class BonjourAdvertiser: @unchecked Sendable {
     private var listener: NWListener?
     private var currentTXT: TXTRecord
 
-    public init(serviceType: String = "_1take-sync._tcp", initialTXT: TXTRecord) {
+    public init(serviceType: String = PeerClockService.type, initialTXT: TXTRecord) {
         self.serviceType = serviceType
         self.currentTXT = initialTXT
     }
@@ -45,12 +45,13 @@ public final class BonjourAdvertiser: @unchecked Sendable {
     /// Start advertising. Must be paired with an NWListener (host mode).
     public func start(listener: NWListener) {
         self.listener = listener
-        let txt = NWTXTRecord(currentTXT.asDictionary())
+        let txt = currentTXT.asNWTXTRecord()
         listener.service = NWListener.Service(type: serviceType, txtRecord: txt)
         logger.info("[Advertiser] started with TXT: role=\(self.currentTXT.role, privacy: .public), term=\(self.currentTXT.term)")
     }
 
     public func stop() {
+        listener?.service = nil
         listener = nil
         logger.info("[Advertiser] stopped")
     }
@@ -59,7 +60,7 @@ public final class BonjourAdvertiser: @unchecked Sendable {
     public func updateTXT(_ newTXT: TXTRecord) {
         currentTXT = newTXT
         if let listener {
-            let txt = NWTXTRecord(newTXT.asDictionary())
+            let txt = newTXT.asNWTXTRecord()
             listener.service = NWListener.Service(type: serviceType, txtRecord: txt)
             logger.info("[Advertiser] TXT updated: role=\(newTXT.role, privacy: .public), term=\(newTXT.term)")
         }
