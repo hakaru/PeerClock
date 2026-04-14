@@ -73,6 +73,7 @@ public final class StarHost: @unchecked Sendable {
             session.connection.cancel()
         }
 
+        // Yield empty list to notify consumers of full disconnect, then finish stream.
         publishClients()
 
         // Finish both streams on stop (Lesson #3)
@@ -112,7 +113,9 @@ public final class StarHost: @unchecked Sendable {
         }
 
         lock.withLock { sessions[sessionID] = session }
-        session.startHandshake()
+        session.startHandshake(onConnectionLost: { [weak self] in
+            self?.removeSession(sessionID)
+        })
     }
 
     private func removeSession(_ id: UUID) {
@@ -134,22 +137,36 @@ public final class StarHost: @unchecked Sendable {
 final class ClientSession: @unchecked Sendable {
     let id: UUID
     let connection: NWConnection
-    var assignedPeerID: PeerID?
+    private(set) var assignedPeerID: PeerID?
     var onHandshakeComplete: (() -> Void)?
 
     private var buffer = Data()
-    // Serial queue per session (Lesson #1)
-    private let sessionQueue = DispatchQueue(label: "net.hakaru.PeerClock.StarHost.session")
+    private var onConnectionLost: (() -> Void)?
+    // Serial queue per session (Lesson #1) — includes id prefix for diagnostics (N-2)
+    private let sessionQueue: DispatchQueue
 
     init(id: UUID, connection: NWConnection) {
         self.id = id
         self.connection = connection
+        self.sessionQueue = DispatchQueue(label: "net.hakaru.PeerClock.StarHost.session.\(id.uuidString.prefix(8))")
     }
 
-    func startHandshake() {
+    func setAssignedPeerID(_ peerID: PeerID) {
+        sessionQueue.async { [weak self] in
+            self?.assignedPeerID = peerID
+        }
+    }
+
+    func startHandshake(onConnectionLost: @escaping () -> Void) {
+        self.onConnectionLost = onConnectionLost
         connection.stateUpdateHandler = { [weak self] state in
-            if case .ready = state {
+            switch state {
+            case .ready:
                 self?.receiveHandshakeRequest()
+            case .failed, .cancelled:
+                self?.onConnectionLost?()
+            default:
+                break
             }
         }
         // Use serial sessionQueue, not .global (Lesson #1)
@@ -158,15 +175,30 @@ final class ClientSession: @unchecked Sendable {
 
     private func receiveHandshakeRequest() {
         func read() {
-            connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, _, _ in
-                guard let self, let data else { return }
-                self.buffer.append(data)
-                if let end = self.buffer.range(of: Data("\r\n\r\n".utf8)) {
-                    let requestHeaders = String(data: self.buffer[..<end.lowerBound], encoding: .utf8) ?? ""
-                    self.sendHandshakeResponse(request: requestHeaders)
-                    self.buffer.removeSubrange(..<end.upperBound)
-                } else {
-                    read()
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, isComplete, error in
+                guard let self else { return }
+                if let error {
+                    logger.error("[ClientSession \(self.id)] handshake recv error: \(error.localizedDescription, privacy: .public)")
+                    self.connection.cancel()
+                    return  // stateUpdateHandler will fire onConnectionLost
+                }
+                if let data, !data.isEmpty {
+                    self.buffer.append(data)
+                    if let end = self.buffer.range(of: Data("\r\n\r\n".utf8)) {
+                        let requestHeaders = String(data: self.buffer[..<end.lowerBound], encoding: .utf8) ?? ""
+                        self.sendHandshakeResponse(request: requestHeaders)
+                        self.buffer.removeSubrange(..<end.upperBound)
+                    } else if self.buffer.count > 16_384 {
+                        // N-1: cap buffer size to prevent memory exhaustion
+                        logger.warning("[ClientSession \(self.id)] handshake buffer overflow")
+                        self.connection.cancel()
+                        return
+                    } else {
+                        read()
+                    }
+                } else if isComplete {
+                    self.connection.cancel()
+                    return
                 }
             }
         }
@@ -182,35 +214,43 @@ final class ClientSession: @unchecked Sendable {
     }
 
     func startFrameLoop(onData: @escaping (Data) -> Void, onClose: @escaping () -> Void) {
-        func loop() {
+        // I-4: Use closure-based pattern so [weak self] avoids retain cycle
+        var loop: (() -> Void)!
+        loop = { [weak self] in
+            guard let self else { return }
             while true {
                 do {
-                    guard let (frame, consumed) = try WebSocketFrame.decode(buffer) else { break }
-                    buffer.removeFirst(consumed)
+                    guard let (frame, consumed) = try WebSocketFrame.decode(self.buffer) else { break }
+                    self.buffer.removeFirst(consumed)
                     switch frame {
                     case .binary(let d):
                         onData(d)
                     case .text(let s):
                         onData(Data(s.utf8))
                     case .close:
-                        connection.cancel()
+                        // C-3: Disable onConnectionLost before cancel to prevent double removeSession
+                        self.onConnectionLost = nil
+                        self.connection.stateUpdateHandler = nil
+                        self.connection.cancel()
                         onClose()
                         return
                     case .ping(let p):
                         // Server uses encodePong (opcode 0xA), unmasked (Lesson #4)
                         let pong = WebSocketFrame.encodePong(p, masked: false)
-                        connection.send(content: pong, completion: .idempotent)
+                        self.connection.send(content: pong, completion: .idempotent)
                     case .pong:
                         break
                     }
                 } catch {
-                    logger.error("[ClientSession] frame decode error: \(error.localizedDescription, privacy: .public)")
-                    connection.cancel()
+                    logger.error("[ClientSession \(self.id)] frame decode error: \(error.localizedDescription, privacy: .public)")
+                    self.onConnectionLost = nil
+                    self.connection.stateUpdateHandler = nil
+                    self.connection.cancel()
                     onClose()
                     return
                 }
             }
-            connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, _, _ in
+            self.connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, _, _ in
                 guard let self, let data, !data.isEmpty else {
                     onClose()
                     return

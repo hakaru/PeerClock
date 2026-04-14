@@ -142,18 +142,21 @@ public final class StarClient: @unchecked Sendable {
 
     private func startFrameLoop(connection: NWConnection, initial: Data) {
         var buffer = initial
-        func loop() {
+        // I-4: Use closure-based pattern so [weak self] avoids retain cycle
+        var loop: (() -> Void)!
+        loop = { [weak self] in
+            guard let self else { return }
             while true {
                 do {
                     guard let (frame, consumed) = try WebSocketFrame.decode(buffer) else { break }
                     buffer.removeFirst(consumed)
                     switch frame {
                     case .binary(let d):
-                        incomingContinuation.yield(d)
+                        self.incomingContinuation.yield(d)
                     case .text(let s):
-                        incomingContinuation.yield(Data(s.utf8))
+                        self.incomingContinuation.yield(Data(s.utf8))
                     case .close:
-                        updateState(.closed("peer close"))
+                        self.updateState(.closed("peer close"))
                         connection.cancel()
                         return
                     case .ping(let p):
@@ -163,7 +166,7 @@ public final class StarClient: @unchecked Sendable {
                         break
                     }
                 } catch {
-                    updateState(.closed("frame decode error: \(error)"))
+                    self.updateState(.closed("frame decode error: \(error)"))
                     return
                 }
             }
