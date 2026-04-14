@@ -1,7 +1,10 @@
 import Foundation
+import os
 #if canImport(Darwin)
 import Darwin
 #endif
+
+private let syncLogger = Logger(subsystem: "net.hakaru.PeerClock", category: "NTPSync")
 
 // MARK: - NTPSyncEngine
 
@@ -67,6 +70,7 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
     // MARK: - SyncEngine
 
     public func start(coordinator: PeerID) async {
+        syncLogger.info("[NTPSync] start() called — coordinator=\(coordinator.description, privacy: .public)")
         lock.withLock {
             self.coordinatorID = coordinator
             self._currentOffset = 0.0
@@ -102,10 +106,38 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
     // MARK: - Core Loop
 
     private func runSyncLoop() async {
-        while !Task.isCancelled {
-            guard let coordinatorID = lock.withLock({ self.coordinatorID }) else { break }
+        syncLogger.info("[NTPSync] runSyncLoop started")
 
-            let measurements = await collectMeasurements(coordinator: coordinatorID)
+        // Single long-lived listener for the entire sync loop.
+        // AsyncStream can only be iterated once — creating a new for-await
+        // per collectMeasurements call would silently consume the stream on
+        // the first round and receive nothing on subsequent rounds.
+        let collector = MeasurementCollector()
+        let stream = self.syncResponseStream
+        let listenerTask = Task { [weak self] in
+            for await (sender, message) in stream {
+                guard let self else { break }
+                let coordinatorID = self.lock.withLock { self.coordinatorID }
+                guard sender == coordinatorID else { continue }
+                guard case .pong(_, let t0, let t1, let t2) = message else { continue }
+
+                let t3 = NTPSyncEngine.now()
+                let offset = NTPSyncEngine.calculateOffset(t0: t0, t1: t1, t2: t2, t3: t3)
+                let delay = NTPSyncEngine.calculateDelay(t0: t0, t1: t1, t2: t2, t3: t3)
+                await collector.add(offset: offset, delay: delay)
+            }
+        }
+        defer { listenerTask.cancel() }
+
+        while !Task.isCancelled {
+            guard let coordinatorID = lock.withLock({ self.coordinatorID }) else {
+                syncLogger.warning("[NTPSync] coordinatorID is nil, breaking loop")
+                break
+            }
+
+            syncLogger.info("[NTPSync] collecting measurements from \(coordinatorID.description, privacy: .public)")
+            let measurements = await collectMeasurements(coordinator: coordinatorID, collector: collector)
+            syncLogger.info("[NTPSync] got \(measurements.count) measurements")
 
             let interval: TimeInterval
             if measurements.isEmpty {
@@ -113,6 +145,7 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
                     self.backoff.recordFailure()
                     return self.backoff.currentInterval
                 }
+                syncLogger.warning("[NTPSync] no measurements, backoff interval=\(interval)s")
             } else {
                 let filtered = NTPSyncEngine.bestHalfFilter(measurements)
                 let offsetNs = NTPSyncEngine.meanOffset(filtered)
@@ -127,6 +160,7 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
                     confidence: min(1.0, Double(filtered.count) / Double(configuration.syncMeasurements))
                 )
                 syncStateContinuation.yield(.synced(offset: offsetSeconds, quality: quality))
+                syncLogger.info("[NTPSync] synced: offset=\(offsetSeconds)s, confidence=\(quality.confidence)")
 
                 interval = lock.withLock {
                     self.backoff.recordSuccess()
@@ -144,29 +178,14 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
 
     // MARK: - Measurement Collection
 
-    /// コーディネーターと SYNC_REQUEST/SYNC_RESPONSE を交換してオフセット測定値を収集する。
-    private func collectMeasurements(coordinator: PeerID) async -> [(offset: Double, delay: UInt64)] {
+    /// コーディネーターに SYNC_REQUEST を送信し、共有リスナー経由で測定値を収集する。
+    private func collectMeasurements(coordinator: PeerID, collector: MeasurementCollector) async -> [(offset: Double, delay: UInt64)] {
+        syncLogger.info("[NTPSync] collectMeasurements: sending \(self.configuration.syncMeasurements) pings to \(coordinator.description, privacy: .public)")
         let count = configuration.syncMeasurements
         let interval = configuration.syncMeasurementInterval
 
-        // 測定結果を蓄積するアクター
-        let collector = MeasurementCollector()
-
-        // レスポンスリスナータスク (CommandRouter 経由で配信される sync メッセージを受信)
-        let stream = self.syncResponseStream
-        let listenerTask = Task {
-            for await (sender, message) in stream {
-                guard sender == coordinator else { continue }
-                guard case .pong(_, let t0, let t1, let t2) = message else {
-                    continue
-                }
-
-                let t3 = NTPSyncEngine.now()
-                let offset = NTPSyncEngine.calculateOffset(t0: t0, t1: t1, t2: t2, t3: t3)
-                let delay = NTPSyncEngine.calculateDelay(t0: t0, t1: t1, t2: t2, t3: t3)
-                await collector.add(offset: offset, delay: delay)
-            }
-        }
+        // Clear previous round's measurements
+        await collector.clear()
 
         // SYNC_REQUEST 送信ループ
         for _ in 0..<count {
@@ -183,9 +202,8 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
             }
         }
 
-        // 全レスポンスが届く余裕を少し待ってからリスナーをキャンセル
+        // 全レスポンスが届く余裕を少し待つ
         try? await Task.sleep(for: .milliseconds(100))
-        listenerTask.cancel()
 
         return await collector.measurements
     }
@@ -240,5 +258,9 @@ private actor MeasurementCollector {
 
     func add(offset: Double, delay: UInt64) {
         measurements.append((offset: offset, delay: delay))
+    }
+
+    func clear() {
+        measurements.removeAll()
     }
 }

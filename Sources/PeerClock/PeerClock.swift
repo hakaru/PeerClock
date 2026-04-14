@@ -1,7 +1,10 @@
 import Foundation
+import os
 #if canImport(UIKit)
 import UIKit
 #endif
+
+private let pcLogger = Logger(subsystem: "net.hakaru.PeerClock", category: "Facade")
 
 /// Facade that integrates all PeerClock components.
 ///
@@ -525,8 +528,10 @@ public final class PeerClock: @unchecked Sendable {
     // MARK: - Private: Coordination Loop
 
     private func runCoordinationLoop(transport: any Transport) async {
+        pcLogger.info("[CoordLoop] started, waiting for peers stream")
         for await peers in transport.peers {
             guard !Task.isCancelled else { break }
+            pcLogger.info("[CoordLoop] peers update: \(peers.count) peers — \(peers.map { $0.description }.joined(separator: ", "), privacy: .public)")
 
             let (newPeerList, elec, eng, hb, prevKnown) = lock.withLock {
                 () -> ([PeerID], CoordinatorElection?, NTPSyncEngine?, HeartbeatMonitor?, Set<PeerID>) in
@@ -535,7 +540,10 @@ public final class PeerClock: @unchecked Sendable {
                 return (Array(peers), election, syncEngine, heartbeatMonitor, prev)
             }
 
-            guard let elec, let eng else { continue }
+            guard let elec, let eng else {
+                pcLogger.warning("[CoordLoop] elec or eng is nil, skipping")
+                continue
+            }
 
             let added = peers.subtracting(prevKnown)
             let removed = prevKnown.subtracting(peers)
@@ -610,14 +618,20 @@ public final class PeerClock: @unchecked Sendable {
             }
 
             // コーディネーターが変わった場合のみ処理
-            guard coordinator != prevCoordinator else { continue }
+            pcLogger.info("[CoordLoop] election: coordinator=\(coordinator?.description ?? "nil", privacy: .public), isCoord=\(isCoord), prevCoord=\(prevCoordinator?.description ?? "nil", privacy: .public)")
+            guard coordinator != prevCoordinator else {
+                pcLogger.info("[CoordLoop] coordinator unchanged, skipping")
+                continue
+            }
 
             if isCoord {
                 // 自分がコーディネーター: 同期エンジンを停止し、レスポンダーを起動
+                pcLogger.info("[CoordLoop] I am coordinator — starting sync responder")
                 await eng.stop()
                 startSyncResponder(transport: transport)
             } else if let coordinator {
                 // 自分はフォロワー: レスポンダーを停止し、同期エンジンを起動
+                pcLogger.info("[CoordLoop] I am follower — starting NTP sync with coordinator \(coordinator.description, privacy: .public)")
                 lock.withLock { () -> Task<Void, Never>? in
                     let t = syncResponderTask
                     syncResponderTask = nil
