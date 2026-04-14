@@ -28,6 +28,10 @@ public final class StarHost: @unchecked Sendable {
     /// Task 12: 1Hz monitor to detect and disconnect slow clients
     private var backpressureMonitor: Task<Void, Never>?
 
+    // Task 13: NWListener auto-restart state
+    private var restartCount = 0
+    private let maxRestarts = 3
+
     public init() {
         var cc: AsyncStream<[ClientConnection]>.Continuation!
         self.clients = AsyncStream { cc = $0 }
@@ -48,9 +52,20 @@ public final class StarHost: @unchecked Sendable {
         l.newConnectionHandler = { [weak self] conn in
             self?.accept(conn)
         }
-        l.stateUpdateHandler = { state in
-            logger.info("[StarHost] listener state=\(String(describing: state), privacy: .public)")
+
+        // Task 13: Handle listener failure with auto-restart
+        l.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed(let error):
+                logger.error("[StarHost] listener failed: \(error.localizedDescription, privacy: .public)")
+                self?.scheduleListenerRestart()
+            case .cancelled:
+                logger.info("[StarHost] listener cancelled")
+            default:
+                logger.info("[StarHost] listener state=\(String(describing: state), privacy: .public)")
+            }
         }
+
         // Use serial listenerQueue, not .global (Lesson #1)
         l.start(queue: listenerQueue)
 
@@ -62,6 +77,9 @@ public final class StarHost: @unchecked Sendable {
     }
 
     public func stop() {
+        // Task 13: Reset restart counter on explicit stop
+        lock.withLock { restartCount = 0 }
+
         backpressureMonitor?.cancel()
         backpressureMonitor = nil
 
@@ -170,6 +188,27 @@ public final class StarHost: @unchecked Sendable {
         }
     }
 
+    // MARK: - Listener auto-restart (Task 13)
+
+    private func scheduleListenerRestart() {
+        let current = lock.withLock { () -> Int in
+            restartCount += 1
+            return restartCount
+        }
+        guard current <= maxRestarts else {
+            logger.error("[StarHost] max listener restarts reached (\(self.maxRestarts)), giving up")
+            return
+        }
+        let backoff = min(30.0, pow(2.0, Double(current)))
+        logger.info("[StarHost] scheduling listener restart (attempt \(current)) in \(backoff, format: .fixed(precision: 1))s")
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(backoff))
+            guard let self else { return }
+            logger.info("[StarHost] restarting listener (attempt \(current))")
+            try? self.start()
+        }
+    }
+
     // MARK: - Test-only accessors
 
     #if DEBUG
@@ -195,6 +234,9 @@ final class ClientSession: @unchecked Sendable {
     private var onConnectionLost: (() -> Void)?
     // Serial queue per session (Lesson #1) — includes id prefix for diagnostics (N-2)
     private let sessionQueue: DispatchQueue
+
+    // Task 13: Handshake partial-read timeout (5s)
+    private var handshakeDeadline: DispatchWorkItem?
 
     init(id: UUID, connection: NWConnection) {
         self.id = id
@@ -247,11 +289,23 @@ final class ClientSession: @unchecked Sendable {
 
     func startHandshake(onConnectionLost: @escaping () -> Void) {
         self.onConnectionLost = onConnectionLost
+
+        // Task 13: Schedule 5s handshake deadline
+        let deadline = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            logger.error("[ClientSession \(self.id)] handshake timeout (5s)")
+            self.connection.cancel()
+        }
+        handshakeDeadline = deadline
+        sessionQueue.asyncAfter(deadline: .now() + 5.0, execute: deadline)
+
         connection.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready:
                 self?.receiveHandshakeRequest()
             case .failed, .cancelled:
+                self?.handshakeDeadline?.cancel()
+                self?.handshakeDeadline = nil
                 self?.onConnectionLost?()
             default:
                 break
@@ -308,6 +362,9 @@ final class ClientSession: @unchecked Sendable {
 
         """
         connection.send(content: Data(response.utf8), completion: .contentProcessed { [weak self] _ in
+            // Task 13: Cancel handshake deadline on successful completion
+            self?.handshakeDeadline?.cancel()
+            self?.handshakeDeadline = nil
             self?.onHandshakeComplete?()
         })
     }

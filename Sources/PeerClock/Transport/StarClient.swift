@@ -29,6 +29,20 @@ public final class StarClient: @unchecked Sendable {
     private var expectedAccept: String?
     private let connectionQueue = DispatchQueue(label: "net.hakaru.PeerClock.StarClient")
 
+    // Task 13: Waiting-state timeout (10s)
+    private var waitingTimeoutWork: DispatchWorkItem?
+
+    // Task 13: Handshake partial-read timeout (5s)
+    private var handshakeDeadline: DispatchWorkItem?
+
+    // Task 13: Reconnect with exponential backoff
+    private var lastEndpoint: NWEndpoint?
+    private var reconnectAttempts = 0
+    private let maxReconnectAttempts = 5
+
+    // Task 13: Suppress reconnect when user explicitly closed
+    private var userClosed = false
+
     public init() {
         var ic: AsyncStream<Data>.Continuation!
         self.incomingMessages = AsyncStream { ic = $0 }
@@ -40,6 +54,13 @@ public final class StarClient: @unchecked Sendable {
     }
 
     public func connect(to endpoint: NWEndpoint) {
+        lastEndpoint = endpoint
+        reconnectAttempts = 0
+        userClosed = false
+        _connect(to: endpoint)
+    }
+
+    private func _connect(to endpoint: NWEndpoint) {
         let params = NWParameters.tcp
         params.includePeerToPeer = true
         let conn = NWConnection(to: endpoint, using: params)
@@ -64,6 +85,8 @@ public final class StarClient: @unchecked Sendable {
     }
 
     public func close() {
+        userClosed = true
+        cancelWaitingTimeout()
         let conn = lock.withLock { () -> NWConnection? in
             let c = connection
             connection = nil
@@ -77,18 +100,62 @@ public final class StarClient: @unchecked Sendable {
         logger.info("[StarClient] nw state=\(String(describing: state), privacy: .public)")
         switch state {
         case .ready:
+            cancelWaitingTimeout()
+            reconnectAttempts = 0
             performHandshake(connection: connection)
+        case .waiting(let error):
+            logger.warning("[StarClient] waiting: \(error.localizedDescription, privacy: .public)")
+            scheduleWaitingTimeout(connection: connection)
         case .failed(let error):
+            cancelWaitingTimeout()
             updateState(.closed("failed: \(error)"))
+            if !userClosed {
+                attemptReconnect()
+            }
         case .cancelled:
+            cancelWaitingTimeout()
             updateState(.closed("cancelled"))
         default:
             break
         }
     }
 
+    // MARK: - Waiting timeout (Task 13)
+
+    private func scheduleWaitingTimeout(connection: NWConnection) {
+        cancelWaitingTimeout()
+        let work = DispatchWorkItem { [weak self, weak connection] in
+            guard let self, let connection else { return }
+            if case .waiting = connection.state {
+                logger.warning("[StarClient] waiting timeout — cancelling")
+                connection.cancel()  // triggers .cancelled → .closed
+            }
+        }
+        waitingTimeoutWork = work
+        connectionQueue.asyncAfter(deadline: .now() + 10.0, execute: work)
+    }
+
+    private func cancelWaitingTimeout() {
+        waitingTimeoutWork?.cancel()
+        waitingTimeoutWork = nil
+    }
+
+    // MARK: - Handshake (with 5s timeout, Task 13)
+
     private func performHandshake(connection: NWConnection) {
         updateState(.handshaking)
+
+        // Schedule 5s handshake deadline
+        let deadline = DispatchWorkItem { [weak self, weak connection] in
+            guard let self, let connection else { return }
+            if case .handshaking = self.lock.withLock({ self.currentState }) {
+                logger.error("[StarClient] handshake timeout (5s)")
+                connection.cancel()
+            }
+        }
+        handshakeDeadline = deadline
+        connectionQueue.asyncAfter(deadline: .now() + 5.0, execute: deadline)
+
         var key = [UInt8](repeating: 0, count: 16)
         let status = SecRandomCopyBytes(kSecRandomDefault, 16, &key)
         guard status == errSecSuccess else {
@@ -192,10 +259,37 @@ public final class StarClient: @unchecked Sendable {
         loop()
     }
 
+    // MARK: - Reconnect with exponential backoff (Task 13)
+
+    private func attemptReconnect() {
+        guard let endpoint = lastEndpoint else { return }
+        guard reconnectAttempts < maxReconnectAttempts else {
+            logger.error("[StarClient] max reconnect attempts reached")
+            return
+        }
+        reconnectAttempts += 1
+        let backoff = min(30.0, pow(2.0, Double(reconnectAttempts)))
+        logger.info("[StarClient] scheduling reconnect attempt \(self.reconnectAttempts) in \(backoff, format: .fixed(precision: 1))s")
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(backoff))
+            guard let self, !self.userClosed else { return }
+            logger.info("[StarClient] reconnecting (attempt \(self.reconnectAttempts))")
+            self._connect(to: endpoint)
+        }
+    }
+
+    // MARK: - State management
+
     private func updateState(_ new: ClientState) {
         lock.withLock { currentState = new }
         stateContinuation.yield(new)
+        if case .ready = new {
+            handshakeDeadline?.cancel()
+            handshakeDeadline = nil
+        }
         if case .closed = new {
+            handshakeDeadline?.cancel()
+            handshakeDeadline = nil
             incomingContinuation.finish()
             stateContinuation.finish()
         }
