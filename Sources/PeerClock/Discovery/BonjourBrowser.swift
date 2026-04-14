@@ -57,6 +57,19 @@ public final class BonjourBrowser: @unchecked Sendable {
         }
     }
 
+    #if DEBUG
+    /// Test-only: inject a peer set directly without actual Bonjour discovery.
+    public func injectForTest(_ peers: [DiscoveredPeer]) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            var dict: [String: DiscoveredPeer] = [:]
+            for p in peers { dict[p.id] = p }
+            self.current = dict
+            self.peersContinuation.yield(peers)
+        }
+    }
+    #endif
+
     // Note: We use the full results snapshot rather than `changes` deltas.
     // For 10-device scale this is simpler and correct; if peer counts grow
     // larger, switch to processing changes (.added/.removed/.changed).
