@@ -157,7 +157,10 @@ public final class StarTransport: Transport, @unchecked Sendable {
 
     /// Promotes this node to host: starts a StarHost NWListener and begins
     /// forwarding events into the `peers` and `incomingMessages` streams.
-    public func promoteToHost() async throws {
+    /// Returns the underlying NWListener so callers (e.g. HostElection) can
+    /// attach Bonjour advertising via BonjourAdvertiser.start(listener:).
+    @discardableResult
+    public func promoteToHost() async throws -> NWListener {
         // Cleanup previous role first
         let (oldHost, oldClient, oldHostTask, oldClientTask) = lock.withLock { () -> (StarHost?, StarClient?, Task<Void, Never>?, Task<Void, Never>?) in
             let h = host
@@ -177,7 +180,7 @@ public final class StarTransport: Transport, @unchecked Sendable {
 
         // Now promote
         let h = StarHost()
-        _ = try h.start()
+        let listener = try h.start()
         let forwardTask = Task<Void, Never> { [weak self] in
             await self?.forwardHostEvents(from: h)
         }
@@ -188,6 +191,7 @@ public final class StarTransport: Transport, @unchecked Sendable {
         }
 
         logger.info("[StarTransport] promoted to host (localPeerID=\(self.localPeerID.description, privacy: .public))")
+        return listener
     }
 
     /// Demotes this node to client, connecting to the given endpoint.

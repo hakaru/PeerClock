@@ -91,6 +91,9 @@ public actor HostElection {
 
         await transitionTo(.discovering)
 
+        // Start Bonjour browsing (critical: without this, peer discovery never runs)
+        browser.start()
+
         // Subscribe to BonjourBrowser
         observerTask = Task { [weak self] in
             guard let self else { return }
@@ -261,15 +264,18 @@ public actor HostElection {
         let newTerm = termStore.update(observed: termStore.current + 1)
         currentSessionGeneration = 0  // new term → reset generation
 
+        let listener: NWListener
         do {
-            try await transport.promoteToHost()
+            listener = try await transport.promoteToHost()
         } catch {
             logger.error("[Election] promoteToHost failed: \(error.localizedDescription, privacy: .public)")
             await transitionTo(.idle)
             return
         }
 
-        // Update TXT to advertise as host (incumbent=true)
+        // Attach Bonjour advertising to the listener and update TXT (incumbent=true).
+        // advertiser.start(listener:) must be called before updateTXT so the service
+        // is published with the correct record from the start.
         let score = HostScore.current(localPeerID: localPeerID, incumbent: true, manualPin: manualPin)
         let scoreData = (try? JSONEncoder().encode(score)) ?? Data()
         let txt = BonjourAdvertiser.TXTRecord(
@@ -278,6 +284,7 @@ public actor HostElection {
             term: newTerm,
             scoreBase64: scoreData.base64EncodedString()
         )
+        advertiser.start(listener: listener)  // critical: actually begin advertising
         advertiser.updateTXT(txt)
 
         await transitionTo(.host(term: newTerm, sessionGeneration: 0))
