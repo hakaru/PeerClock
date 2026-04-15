@@ -1,8 +1,10 @@
 import Foundation
 import Network
 import os
+import os.signpost
 
 private let logger = Logger(subsystem: "net.hakaru.PeerClock", category: "HostElection")
+private let signposter = OSSignposter(subsystem: "net.hakaru.PeerClock", category: "ElectionTiming")
 
 /// Election state per spec §4.2.
 public enum ElectionState: Sendable, Equatable {
@@ -82,6 +84,11 @@ public actor HostElection {
     /// Begin election. Idempotent — no-op if already running.
     public func start() async {
         guard case .idle = state else { return }
+
+        let signpostID = signposter.makeSignpostID()
+        let interval = signposter.beginInterval("Election", id: signpostID)
+        defer { signposter.endInterval("Election", interval) }
+
         await transitionTo(.discovering)
 
         // Subscribe to BonjourBrowser

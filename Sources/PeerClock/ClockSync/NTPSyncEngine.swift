@@ -1,10 +1,12 @@
 import Foundation
 import os
+import os.signpost
 #if canImport(Darwin)
 import Darwin
 #endif
 
 private let syncLogger = Logger(subsystem: "net.hakaru.PeerClock", category: "NTPSync")
+private let syncSignposter = OSSignposter(subsystem: "net.hakaru.PeerClock", category: "NTPSync")
 
 // MARK: - NTPSyncEngine
 
@@ -183,6 +185,10 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
         syncLogger.info("[NTPSync] collectMeasurements: sending \(self.configuration.syncMeasurements) pings to \(coordinator.description, privacy: .public)")
         let count = configuration.syncMeasurements
         let interval = configuration.syncMeasurementInterval
+
+        let signpostID = syncSignposter.makeSignpostID()
+        let ntpInterval = syncSignposter.beginInterval("NTPSyncRound", id: signpostID)
+        defer { syncSignposter.endInterval("NTPSyncRound", ntpInterval) }
 
         // Clear previous round's measurements
         await collector.clear()
