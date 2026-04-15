@@ -35,12 +35,12 @@ public final class StarClient: @unchecked Sendable {
     // Task 13: Handshake partial-read timeout (5s)
     private var handshakeDeadline: DispatchWorkItem?
 
-    // Task 13: Reconnect with exponential backoff
+    // Task 13: Reconnect with exponential backoff — protected by `lock`
     private var lastEndpoint: NWEndpoint?
     private var reconnectAttempts = 0
     private let maxReconnectAttempts = 5
 
-    // Task 13: Suppress reconnect when user explicitly closed
+    // Task 13: Suppress reconnect when user explicitly closed — protected by `lock`
     private var userClosed = false
 
     public init() {
@@ -54,9 +54,11 @@ public final class StarClient: @unchecked Sendable {
     }
 
     public func connect(to endpoint: NWEndpoint) {
-        lastEndpoint = endpoint
-        reconnectAttempts = 0
-        userClosed = false
+        lock.withLock {
+            lastEndpoint = endpoint
+            reconnectAttempts = 0
+            userClosed = false
+        }
         _connect(to: endpoint)
     }
 
@@ -85,7 +87,7 @@ public final class StarClient: @unchecked Sendable {
     }
 
     public func close() {
-        userClosed = true
+        lock.withLock { userClosed = true }
         cancelWaitingTimeout()
         let conn = lock.withLock { () -> NWConnection? in
             let c = connection
@@ -101,7 +103,7 @@ public final class StarClient: @unchecked Sendable {
         switch state {
         case .ready:
             cancelWaitingTimeout()
-            reconnectAttempts = 0
+            lock.withLock { reconnectAttempts = 0 }
             performHandshake(connection: connection)
         case .waiting(let error):
             logger.warning("[StarClient] waiting: \(error.localizedDescription, privacy: .public)")
@@ -109,7 +111,8 @@ public final class StarClient: @unchecked Sendable {
         case .failed(let error):
             cancelWaitingTimeout()
             updateState(.closed("failed: \(error)"))
-            if !userClosed {
+            let shouldReconnect = lock.withLock { !userClosed }
+            if shouldReconnect {
                 attemptReconnect()
             }
         case .cancelled:
@@ -269,18 +272,27 @@ public final class StarClient: @unchecked Sendable {
     // MARK: - Reconnect with exponential backoff (Task 13)
 
     private func attemptReconnect() {
-        guard let endpoint = lastEndpoint else { return }
-        guard reconnectAttempts < maxReconnectAttempts else {
+        // Snapshot mutable state atomically before use
+        let (endpoint, attempts, isClosed) = lock.withLock {
+            (lastEndpoint, reconnectAttempts, userClosed)
+        }
+        guard !isClosed, let endpoint else { return }
+        guard attempts < maxReconnectAttempts else {
             logger.error("[StarClient] max reconnect attempts reached")
             return
         }
-        reconnectAttempts += 1
-        let backoff = min(30.0, pow(2.0, Double(reconnectAttempts)))
-        logger.info("[StarClient] scheduling reconnect attempt \(self.reconnectAttempts) in \(backoff, format: .fixed(precision: 1))s")
+        let nextAttempt = lock.withLock { () -> Int in
+            reconnectAttempts += 1
+            return reconnectAttempts
+        }
+        let backoff = min(30.0, pow(2.0, Double(nextAttempt)))
+        logger.info("[StarClient] scheduling reconnect attempt \(nextAttempt) in \(backoff, format: .fixed(precision: 1))s")
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(backoff))
-            guard let self, !self.userClosed else { return }
-            logger.info("[StarClient] reconnecting (attempt \(self.reconnectAttempts))")
+            guard let self else { return }
+            let stillOpen = self.lock.withLock { !self.userClosed }
+            guard stillOpen else { return }
+            logger.info("[StarClient] reconnecting (attempt \(nextAttempt))")
             self._connect(to: endpoint)
         }
     }

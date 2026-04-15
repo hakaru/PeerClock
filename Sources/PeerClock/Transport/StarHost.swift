@@ -221,8 +221,12 @@ public final class StarHost: @unchecked Sendable {
 final class ClientSession: @unchecked Sendable {
     let id: UUID
     let connection: NWConnection
-    private(set) var assignedPeerID: PeerID?
     var onHandshakeComplete: (() -> Void)?
+
+    // Thread-safe assignedPeerID — reads from any context, written on sessionQueue
+    private let stateLock = NSLock()
+    private var _assignedPeerID: PeerID?
+    var assignedPeerID: PeerID? { stateLock.withLock { _assignedPeerID } }
 
     /// Task 11: Per-client priority dispatcher (unified Task 11+12 design)
     let dispatcher = MessageDispatcher()
@@ -245,9 +249,7 @@ final class ClientSession: @unchecked Sendable {
     }
 
     func setAssignedPeerID(_ peerID: PeerID) {
-        sessionQueue.async { [weak self] in
-            self?.assignedPeerID = peerID
-        }
+        stateLock.withLock { _assignedPeerID = peerID }
     }
 
     /// Task 11: Enqueue data for prioritized send.
