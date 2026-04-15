@@ -221,6 +221,13 @@ public final class StarClient: @unchecked Sendable {
         var loop: (() -> Void)!
         loop = { [weak self] in
             guard let self else { return }
+            // DoS guard: cap buffer at 2 MiB (one max in-flight frame + next chunk)
+            let maxBufferSize = 2 * 1_048_576
+            if buffer.count > maxBufferSize {
+                logger.error("[StarClient] buffer overflow (\(buffer.count) bytes) — closing connection")
+                connection.cancel()
+                return
+            }
             while true {
                 do {
                     guard let (frame, consumed) = try WebSocketFrame.decode(buffer) else { break }
@@ -290,8 +297,17 @@ public final class StarClient: @unchecked Sendable {
         if case .closed = new {
             handshakeDeadline?.cancel()
             handshakeDeadline = nil
-            incomingContinuation.finish()
-            stateContinuation.finish()
+            // NOTE: streams remain open to allow reconnect. Call destroy() for permanent teardown.
         }
+    }
+
+    /// Permanently tears down the client. Closes the connection and finishes both
+    /// async streams. After destroy(), the client cannot be reused — all iterators
+    /// will see stream termination. This is distinct from `.closed` state, which
+    /// represents a transient disconnect that may be followed by reconnect.
+    public func destroy() {
+        close()
+        incomingContinuation.finish()
+        stateContinuation.finish()
     }
 }

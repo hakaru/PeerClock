@@ -188,6 +188,61 @@ struct WebSocketFrameTests {
         }
     }
 
+    // MARK: - DoS payload cap tests (Critical #3)
+
+    @Test func rejectsOversizedDataFrame() throws {
+        // Craft a binary frame header claiming 2 MiB payload (beyond the 1 MiB default cap)
+        // FIN=1, opcode=0x2 (binary), unmasked, 64-bit length = 2_097_152
+        var bytes: [UInt8] = [0x82, 0x7F]  // FIN + binary, 64-bit length marker
+        let oversize: UInt64 = 2_097_152
+        for i in 0..<8 {
+            bytes.append(UInt8((oversize >> (56 - i * 8)) & 0xFF))
+        }
+        // Don't provide the actual payload — the cap check fires before the payload completeness check
+        #expect(throws: WebSocketFrame.DecodeError.payloadTooLarge) {
+            _ = try WebSocketFrame.decode(Data(bytes))
+        }
+    }
+
+    @Test func rejectsOversizedTextFrame() throws {
+        // Craft a text frame header claiming payload larger than custom cap
+        let customCap = 1024
+        // FIN=1, opcode=0x1 (text), unmasked, 16-bit length = 1025
+        var bytes: [UInt8] = [0x81, 0x7E, 0x04, 0x01]  // len marker 126 + 16-bit len = 1025
+        bytes.append(contentsOf: [UInt8](repeating: 0x41, count: 1025))
+        #expect(throws: WebSocketFrame.DecodeError.payloadTooLarge) {
+            _ = try WebSocketFrame.decode(Data(bytes), maxDataPayloadSize: customCap)
+        }
+    }
+
+    @Test func acceptsPayloadAtExactCap() throws {
+        // Payload exactly at cap should decode successfully
+        let cap = 16
+        let payload = Data(repeating: 0x41, count: cap)  // 16 bytes of 'A'
+        let encoded = WebSocketFrame.encode(binary: payload, masked: false)
+        let result = try WebSocketFrame.decode(encoded, maxDataPayloadSize: cap)
+        #expect(result != nil)
+        if case .binary(let data) = result?.frame {
+            #expect(data == payload)
+        } else {
+            Issue.record("Expected .binary, got \(String(describing: result?.frame))")
+        }
+    }
+
+    @Test func controlFramesNotAffectedByCap() throws {
+        // Ping frames (control) should not be subject to the data payload cap
+        let pingData = Data(repeating: 0x01, count: 10)
+        let encoded = WebSocketFrame.encodePing(pingData, masked: false)
+        // Even with a very small cap, control frames should decode fine
+        let result = try WebSocketFrame.decode(encoded, maxDataPayloadSize: 1)
+        #expect(result != nil)
+        if case .ping(let data) = result?.frame {
+            #expect(data == pingData)
+        } else {
+            Issue.record("Expected .ping, got \(String(describing: result?.frame))")
+        }
+    }
+
     @Test func roundTripExtended64BitPayload() throws {
         // 65536-byte payload forces 8-byte extended length encoding
         let payloadSize = 65536

@@ -381,6 +381,16 @@ final class ClientSession: @unchecked Sendable {
         var loop: (() -> Void)!
         loop = { [weak self] in
             guard let self else { return }
+            // DoS guard: cap buffer at 2 MiB (one max in-flight frame + next chunk)
+            let maxBufferSize = 2 * 1_048_576
+            if self.buffer.count > maxBufferSize {
+                logger.error("[ClientSession \(self.id)] buffer overflow (\(self.buffer.count) bytes) — closing connection")
+                self.onConnectionLost = nil
+                self.connection.stateUpdateHandler = nil
+                self.connection.cancel()
+                onClose()
+                return
+            }
             while true {
                 do {
                     guard let (frame, consumed) = try WebSocketFrame.decode(self.buffer) else { break }

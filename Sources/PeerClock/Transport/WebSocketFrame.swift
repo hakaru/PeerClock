@@ -90,7 +90,13 @@ public enum WebSocketFrame: Equatable {
 
     /// Decode a single frame from the start of `data`. Returns the frame and
     /// the number of bytes consumed. Returns nil if not enough data yet.
-    public static func decode(_ data: Data) throws -> (frame: WebSocketFrame, consumed: Int)? {
+    ///
+    /// - Parameter maxDataPayloadSize: Maximum allowed payload size for data frames
+    ///   (text/binary). Defaults to 1 MiB. Control frames retain the existing 125-byte RFC cap.
+    public static func decode(
+        _ data: Data,
+        maxDataPayloadSize: Int = 1_048_576
+    ) throws -> (frame: WebSocketFrame, consumed: Int)? {
         guard data.count >= 2 else { return nil }
 
         let byte0 = data[data.startIndex]
@@ -135,6 +141,13 @@ public enum WebSocketFrame: Equatable {
         if opcode == 0x8 || opcode == 0x9 || opcode == 0xA {
             guard payloadLen <= 125 else {
                 throw DecodeError.controlFrameTooLarge
+            }
+        }
+
+        // Data frames (text/binary): enforce caller-supplied cap to prevent DoS via memory exhaustion
+        if opcode == 0x1 || opcode == 0x2 {
+            if payloadLen > maxDataPayloadSize {
+                throw DecodeError.payloadTooLarge
             }
         }
 

@@ -91,7 +91,7 @@ public final class StarTransport: Transport, @unchecked Sendable {
         capturedHostTask?.cancel()
         capturedClientTask?.cancel()
         capturedHost?.stop()
-        capturedClient?.close()
+        capturedClient?.destroy()
 
         peersContinuation.yield([])
         // Streams remain open — StarTransport can be restarted after stop
@@ -176,7 +176,7 @@ public final class StarTransport: Transport, @unchecked Sendable {
         oldHostTask?.cancel()
         oldClientTask?.cancel()
         oldHost?.stop()
-        oldClient?.close()
+        oldClient?.destroy()
 
         // Now promote
         let h = StarHost()
@@ -211,7 +211,7 @@ public final class StarTransport: Transport, @unchecked Sendable {
         oldHostTask?.cancel()
         oldClientTask?.cancel()
         oldHost?.stop()
-        oldClient?.close()
+        oldClient?.destroy()
 
         // Now demote
         let c = StarClient()
