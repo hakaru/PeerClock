@@ -24,7 +24,9 @@ struct ControlMessageCodingTests {
             preset: "studio_heavy",
             sessionID: UUID(),
             commandID: UUID(),
-            commandVersion: 1
+            commandVersion: 1,
+            term: 42,
+            sessionGeneration: 7
         )
         let data = try JSONEncoder().encode(msg)
         let decoded = try JSONDecoder().decode(ControlMessage.self, from: data)
@@ -36,7 +38,9 @@ struct ControlMessageCodingTests {
             atTimeNs: 555000,
             sessionID: UUID(),
             commandID: UUID(),
-            commandVersion: 2
+            commandVersion: 2,
+            term: 42,
+            sessionGeneration: 7
         )
         let data = try JSONEncoder().encode(msg)
         let decoded = try JSONDecoder().decode(ControlMessage.self, from: data)

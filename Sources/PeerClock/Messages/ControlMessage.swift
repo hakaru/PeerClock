@@ -21,13 +21,17 @@ public enum ControlMessage: Codable, Equatable, Sendable {
         preset: String,
         sessionID: UUID,
         commandID: UUID,
-        commandVersion: UInt64
+        commandVersion: UInt64,
+        term: UInt64,
+        sessionGeneration: UInt64
     )
     case stopRecording(
         atTimeNs: UInt64,
         sessionID: UUID,
         commandID: UUID,
-        commandVersion: UInt64
+        commandVersion: UInt64,
+        term: UInt64,
+        sessionGeneration: UInt64
     )
     case heartbeat(hostTimeNs: UInt64, term: UInt64)
     // TODO(v0.3): consider strongly-typed enums for `state` and `preset`
@@ -52,12 +56,12 @@ public enum ControlMessage: Codable, Equatable, Sendable {
         case .sessionInit(let sessionID, let term, let sessionGeneration, let hostPeerID, let timeBaseNs):
             try container.encode("session_init", forKey: .type)
             try container.encode(SessionInitPayload(sessionID: sessionID, term: term, sessionGeneration: sessionGeneration, hostPeerID: hostPeerID, timeBaseNs: timeBaseNs), forKey: .payload)
-        case .startRecording(let targetTimeNs, let preset, let sessionID, let commandID, let commandVersion):
+        case .startRecording(let targetTimeNs, let preset, let sessionID, let commandID, let commandVersion, let term, let sessionGeneration):
             try container.encode("start_recording", forKey: .type)
-            try container.encode(StartRecordingPayload(targetTimeNs: targetTimeNs, preset: preset, sessionID: sessionID, commandID: commandID, commandVersion: commandVersion), forKey: .payload)
-        case .stopRecording(let atTimeNs, let sessionID, let commandID, let commandVersion):
+            try container.encode(StartRecordingPayload(targetTimeNs: targetTimeNs, preset: preset, sessionID: sessionID, commandID: commandID, commandVersion: commandVersion, term: term, sessionGeneration: sessionGeneration), forKey: .payload)
+        case .stopRecording(let atTimeNs, let sessionID, let commandID, let commandVersion, let term, let sessionGeneration):
             try container.encode("stop_recording", forKey: .type)
-            try container.encode(StopRecordingPayload(atTimeNs: atTimeNs, sessionID: sessionID, commandID: commandID, commandVersion: commandVersion), forKey: .payload)
+            try container.encode(StopRecordingPayload(atTimeNs: atTimeNs, sessionID: sessionID, commandID: commandID, commandVersion: commandVersion, term: term, sessionGeneration: sessionGeneration), forKey: .payload)
         case .heartbeat(let hostTimeNs, let term):
             try container.encode("heartbeat", forKey: .type)
             try container.encode(HeartbeatPayload(hostTimeNs: hostTimeNs, term: term), forKey: .payload)
@@ -79,10 +83,10 @@ public enum ControlMessage: Codable, Equatable, Sendable {
             self = .sessionInit(sessionID: p.sessionID, term: p.term, sessionGeneration: p.sessionGeneration, hostPeerID: p.hostPeerID, timeBaseNs: p.timeBaseNs)
         case "start_recording":
             let p = try container.decode(StartRecordingPayload.self, forKey: .payload)
-            self = .startRecording(targetTimeNs: p.targetTimeNs, preset: p.preset, sessionID: p.sessionID, commandID: p.commandID, commandVersion: p.commandVersion)
+            self = .startRecording(targetTimeNs: p.targetTimeNs, preset: p.preset, sessionID: p.sessionID, commandID: p.commandID, commandVersion: p.commandVersion, term: p.term, sessionGeneration: p.sessionGeneration)
         case "stop_recording":
             let p = try container.decode(StopRecordingPayload.self, forKey: .payload)
-            self = .stopRecording(atTimeNs: p.atTimeNs, sessionID: p.sessionID, commandID: p.commandID, commandVersion: p.commandVersion)
+            self = .stopRecording(atTimeNs: p.atTimeNs, sessionID: p.sessionID, commandID: p.commandID, commandVersion: p.commandVersion, term: p.term, sessionGeneration: p.sessionGeneration)
         case "heartbeat":
             let p = try container.decode(HeartbeatPayload.self, forKey: .payload)
             self = .heartbeat(hostTimeNs: p.hostTimeNs, term: p.term)
@@ -112,12 +116,16 @@ private struct StartRecordingPayload: Codable {
     let sessionID: UUID
     let commandID: UUID
     let commandVersion: UInt64
+    let term: UInt64
+    let sessionGeneration: UInt64
 }
 private struct StopRecordingPayload: Codable {
     let atTimeNs: UInt64
     let sessionID: UUID
     let commandID: UUID
     let commandVersion: UInt64
+    let term: UInt64
+    let sessionGeneration: UInt64
 }
 private struct HeartbeatPayload: Codable {
     let hostTimeNs: UInt64

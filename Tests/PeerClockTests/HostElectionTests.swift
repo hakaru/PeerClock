@@ -89,6 +89,65 @@ struct HostElectionTests {
         await election2.stop()
     }
 
+    @Test func validateIncomingCommandTermAcceptsAtIdleState() async {
+        // In idle state (term=0), any observed term >= 0 should be accepted
+        let election = makeElection()
+        let accepted = await election.validateIncomingCommandTerm(0)
+        #expect(accepted)
+    }
+
+    @Test func validateIncomingCommandTermRejectsStale() async {
+        // Seed a high term into the store so term 0 looks stale
+        let store = makeStore()
+        store.update(observed: 10)
+
+        let peerID = UUID()
+        let transport = StarTransport(localPeerID: PeerID(peerID))
+        let browser = BonjourBrowser()
+        let advertiser = BonjourAdvertiser(initialTXT: BonjourAdvertiser.TXTRecord(
+            role: "client",
+            peerID: peerID.uuidString,
+            term: 0,
+            scoreBase64: ""
+        ))
+        let election = HostElection(
+            localPeerID: peerID,
+            transport: transport,
+            browser: browser,
+            advertiser: advertiser,
+            termStore: store
+        )
+
+        // term=0 is stale vs maxSeen=10
+        let accepted = await election.validateIncomingCommandTerm(0)
+        #expect(!accepted)
+    }
+
+    @Test func validateIncomingCommandTermAcceptsCurrentTerm() async {
+        let store = makeStore()
+        store.update(observed: 5)
+
+        let peerID = UUID()
+        let transport = StarTransport(localPeerID: PeerID(peerID))
+        let browser = BonjourBrowser()
+        let advertiser = BonjourAdvertiser(initialTXT: BonjourAdvertiser.TXTRecord(
+            role: "client",
+            peerID: peerID.uuidString,
+            term: 5,
+            scoreBase64: ""
+        ))
+        let election = HostElection(
+            localPeerID: peerID,
+            transport: transport,
+            browser: browser,
+            advertiser: advertiser,
+            termStore: store
+        )
+
+        let accepted = await election.validateIncomingCommandTerm(5)
+        #expect(accepted)
+    }
+
     @Test func electionStateEquality() {
         let idle1 = ElectionState.idle
         let idle2 = ElectionState.idle

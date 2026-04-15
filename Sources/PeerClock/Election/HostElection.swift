@@ -291,6 +291,51 @@ public actor HostElection {
         joinRetryCount = 0
     }
 
+    /// Validate an incoming command's term against local state.
+    ///
+    /// Returns `true` if the command should be accepted, `false` if it is stale
+    /// and must be dropped. If we are currently host but the observed term is
+    /// higher than ours, triggers a force-demote (split-brain recovery) and
+    /// returns `false` — the command belongs to a newer coordinator.
+    ///
+    /// This is the entry point that wires `HostFencing` into the command plane
+    /// so that `startRecording`/`stopRecording` messages carrying a term can be
+    /// fenced at message granularity (Raft-style term propagation).
+    public func validateIncomingCommandTerm(_ observedTerm: UInt64) async -> Bool {
+        let (localIsHost, localTerm) = currentRoleInfo()
+        let decision = fencing.validate(
+            observedTerm: observedTerm,
+            localIsHost: localIsHost,
+            localTerm: localTerm
+        )
+        switch decision {
+        case .accept:
+            return true
+        case .rejectStale:
+            return false
+        case .forceDemote:
+            logger.warning("[Election] force demote triggered by incoming command term \(observedTerm)")
+            await transitionTo(.demoted)
+            await transport.stop()
+            advertiser.stop()
+            Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(200))
+                await self?.transitionTo(.discovering)
+                await self?.evaluatePeerSet()
+            }
+            return false  // no longer coordinating; drop the command
+        }
+    }
+
+    private func currentRoleInfo() -> (isHost: Bool, term: UInt64) {
+        switch state {
+        case .host(let term, _):
+            return (true, term)
+        default:
+            return (false, 0)
+        }
+    }
+
     /// Increment sessionGeneration (e.g. for next recording session within same term).
     public func nextSessionGeneration() async -> UInt64 {
         currentSessionGeneration += 1
