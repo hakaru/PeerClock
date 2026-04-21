@@ -5,7 +5,7 @@ import Observation
 @MainActor
 final class MetronomeViewModel {
     var bpm: Int = 120
-    var subdivision: Subdivision = .none
+    var timeSignature: TimeSignature = .fourFour
     var isPlaying: Bool = false
     var currentBeat: Int = 0
     var flashIntensity: Double = 0
@@ -41,7 +41,7 @@ final class MetronomeViewModel {
         peerService.onConfigReceived = { [weak self] config, applyAtNs in
             guard let self else { return }
             self.bpm = config.bpm
-            self.subdivision = config.subdivision
+            self.timeSignature = config.timeSignature
             Task {
                 await self.engine.updateConfigAt(config, applyAtNs: applyAtNs)
             }
@@ -103,7 +103,7 @@ final class MetronomeViewModel {
     func setBPM(_ newBPM: Int) async {
         let clamped = max(30, min(300, newBPM))
         bpm = clamped
-        let config = MetronomeConfig(bpm: bpm, subdivision: subdivision)
+        let config = makeConfig()
         let applyAt = await engine.nextDownbeatApplyTime()
         await engine.updateConfigAt(config, applyAtNs: applyAt)
         if peerService.hasPeers {
@@ -111,9 +111,9 @@ final class MetronomeViewModel {
         }
     }
 
-    func setSubdivision(_ sub: Subdivision) async {
-        subdivision = sub
-        let config = MetronomeConfig(bpm: bpm, subdivision: subdivision)
+    func setTimeSignature(_ ts: TimeSignature) async {
+        timeSignature = ts
+        let config = makeConfig()
         let applyAt = await engine.nextDownbeatApplyTime()
         await engine.updateConfigAt(config, applyAtNs: applyAt)
         if peerService.hasPeers {
@@ -122,7 +122,14 @@ final class MetronomeViewModel {
     }
 
     private func syncConfig() async {
-        let config = MetronomeConfig(bpm: bpm, subdivision: subdivision)
-        await engine.updateConfig(config)
+        await engine.updateConfig(makeConfig())
+    }
+
+    func getBarProgress() async -> Double {
+        await engine.barProgress()
+    }
+
+    private func makeConfig() -> MetronomeConfig {
+        MetronomeConfig(bpm: bpm, timeSignature: timeSignature)
     }
 }

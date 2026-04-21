@@ -85,6 +85,27 @@ actor MetronomeEngine {
         config
     }
 
+    func barProgress() -> Double {
+        guard isPlaying else { return 0 }
+        let now = mach_absolute_time()
+        let subIntervalMach = nsToMach(UInt64(config.subIntervalSeconds * 1_000_000_000))
+        guard subIntervalMach > 0 else { return 0 }
+
+        let totalSubs = config.totalSubsPerBar
+
+        // currentSubBeat/nextBeatHostTime may be scheduled ahead of playback.
+        // Compute actual playback position by subtracting the lead time.
+        let subsUntilNext: Double = nextBeatHostTime > now
+            ? Double(nextBeatHostTime - now) / Double(subIntervalMach)
+            : 0
+
+        var position = Double(currentSubBeat) - subsUntilNext
+        if position < 0 { position += Double(totalSubs) }
+
+        let progress = position / Double(totalSubs)
+        return max(0, min(0.999, progress))
+    }
+
     /// Calculate applyAtNs: next downbeat after now + 500ms
     func nextDownbeatApplyTime() -> UInt64 {
         guard let provider = syncedNowProvider else { return 0 }
@@ -111,7 +132,7 @@ actor MetronomeEngine {
         nextBeatHostTime = hostNow + nsToMach(deltaNs)
 
         // Calculate which sub-beat we're at
-        let totalSubsPerBar = UInt64(config.beatsPerBar * config.subdivision.rawValue)
+        let totalSubsPerBar = UInt64(config.totalSubsPerBar)
         currentSubBeat = Int((nextSubBeatSynced / subIntervalNs) % totalSubsPerBar)
     }
 
@@ -147,7 +168,7 @@ actor MetronomeEngine {
 
         let subIntervalNs = UInt64(config.subIntervalSeconds * 1_000_000_000)
         let subIntervalMach = nsToMach(subIntervalNs)
-        let totalSubsPerBar = config.beatsPerBar * config.subdivision.rawValue
+        let totalSubsPerBar = config.totalSubsPerBar
 
         guard subIntervalMach > 0 else { return }
 
@@ -171,7 +192,7 @@ actor MetronomeEngine {
 
             synthesizer.scheduleClick(tickType, at: audioTime)
 
-            let beatIndex = (currentSubBeat / config.subdivision.rawValue) % config.beatsPerBar
+            let beatIndex = (currentSubBeat / config.subdivisionsPerBeat) % config.beatsPerBar
             onTick?(tickType, beatIndex)
 
             currentSubBeat = (currentSubBeat + 1) % totalSubsPerBar
@@ -180,7 +201,7 @@ actor MetronomeEngine {
     }
 
     private func tickTypeFor(subBeat: Int) -> TickType {
-        let subsPerBeat = config.subdivision.rawValue
+        let subsPerBeat = config.subdivisionsPerBeat
         if subBeat == 0 {
             return .downbeat
         } else if subBeat % subsPerBeat == 0 {
