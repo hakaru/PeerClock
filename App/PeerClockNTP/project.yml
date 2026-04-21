@@ -33,6 +33,6 @@ targets:
           UIRequiredDeviceCapabilities=[arm64];
           UISupportedInterfaceOrientations=[UIInterfaceOrientationPortrait];
           NSLocalNetworkUsageDescription=PeerClock NTP uses local network to discover and sync with nearby devices;
-          NSBonjourServices=[_peerclock._udp]
+          NSBonjourServices=[_peerclock._tcp,_peerclock._udp]
         SWIFT_STRICT_CONCURRENCY: complete
         SWIFT_VERSION: "6.0"

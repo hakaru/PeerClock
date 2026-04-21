@@ -210,6 +210,20 @@ swift test --filter NTPSyncEngineTests  # single suite
 - [Changelog](CHANGELOG.md) — release history
 - [Contributing](CONTRIBUTING.md) — how to build, test, and submit changes
 
+## Demo Apps
+
+### PeerClock NTP (`App/PeerClockNTP`)
+
+Minimal NTP time display + TAP SYNC demo. Shows PeerClock's clock synchronization in action — tap a button and all connected devices flash simultaneously.
+
+### PeerClock Metronome (`App/PeerClockMetronome`)
+
+P2P-synchronized metronome. Multiple iPhones click in unison with ±2ms precision. Features:
+- BPM adjustment (30–300), subdivisions (1/1, 1/2, 1/3, 1/4)
+- Precise audio scheduling via `mach_absolute_time` + `AVAudioTime(hostTime:)`
+- P2P sync: beat boundaries computed from `PeerClock.now`, BPM/subdivision/play state broadcast to peers
+- Visual flash on each beat
+
 ## Background
 
 PeerClock was born from [1Take](https://github.com/hakaru/1Take), an iOS multi-device audio recording app. The need to synchronize multiple iPhones led to the realization that P2P device coordination is a general-purpose problem with no existing Swift solution — especially not with peer-equal topology.
