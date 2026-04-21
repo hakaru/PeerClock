@@ -255,3 +255,238 @@ App/PeerClockNTP/
 - **カテゴリ**: Utilities
 - **キーワード**: NTP, clock, sync, peer, time, millisecond, offline, precision
 - **説明文 1行目**: 「ネットがなくても、隣のデバイスと時間が揃う唯一の時計」
+
+---
+
+# PeerClock Metronome — 同期メトロノームアプリ計画
+
+## 概要
+
+PeerClock ライブラリの ±2ms 同期精度を「音」で体感させるデモアプリ。
+複数 iPhone を並べて同じ BPM でクリック音が鳴り、人間の耳では完全に同時に聞こえる。
+
+**コンセプト**: 「バンドメンバー全員のメトロノームが揃う、世界初の P2P 同期メトロノーム」
+
+**差別化**: 既存メトロノームアプリは全て単独動作。複数デバイス同期は存在しない。
+
+## 動作モード
+
+| 状態 | 動作 |
+|------|------|
+| 単独 | ローカルメトロノーム（普通のメトロノームとして動作） |
+| P2P 同期 | PeerClock.now で拍タイミング計算 → 全端末同時クリック |
+
+## 拍構造
+
+| 種別 | クリック音 | フラッシュ |
+|------|-----------|-----------|
+| ダウンビート（1拍目） | 強クリック（高音 1000Hz） | 全画面フラッシュ（明るい） |
+| ビート（2,3,4拍目） | 中クリック（800Hz） | 中フラッシュ |
+| サブディビジョン | 弱クリック（低音 600Hz） | 小フラッシュ（薄い） |
+
+## サブディビジョン
+
+- なし: ♩ のみ
+- 1/2: ♩ ♪ ♩ ♪（8分音符）
+- 1/3: ♩ ♪♪ ♩ ♪♪（3連符）
+- 1/4: ♩ ♬ ♩ ♬（16分音符）
+
+## 画面構成（1画面）
+
+```
+┌─────────────────────────────┐
+│                             │
+│          120 BPM            │  ← 大きい数字（上下スワイプで調整）
+│                             │
+│    [ ♩ ] [♪♪] [♪♪♪] [♬]    │  ← サブディビジョン選択
+│                             │
+│        ●  ○  ○  ○          │  ← ビート位置インジケーター
+│                             │
+│       [ ▶ PLAY ]            │  ← 再生/停止
+│                             │
+│    Peers: 2 connected       │  ← ピア接続数
+└─────────────────────────────┘
+```
+
+背景全体がビートに合わせてフラッシュ。
+
+## 同期方式
+
+```
+全端末が同じ BPM + 同じ時計（PeerClock.now）を持つ
+→ nextBeat = ceil(now / beatIntervalNs) * beatIntervalNs
+→ 各端末が独立してスケジュール → 全端末同時にクリック（±2ms）
+
+BPM/subdivision 変更:
+→ 送信側が applyAtNs（= now + 500ms 以降の最初のダウンビート）を計算
+→ CommandRouter.broadcast で {config, applyAtNs} を配信
+→ 全端末が applyAtNs から新設定を適用（合意形成）
+
+音響遅延補正:
+→ AVAudioSession.outputLatency を取得
+→ scheduleBuffer(at:) の再生時刻を outputLatency 分前倒し
+→ デバイス間のハードウェア遅延差を吸収
+
+スケジューリング:
+→ AVAudioPlayerNode.scheduleBuffer(at: AVAudioTime) で拍を直接スケジュール
+→ ルックアヘッド: 常に 2〜3 拍先までスケジュール（OS ジッター耐性）
+→ busy-wait 不要（バッテリー節約）
+```
+
+## 技術スタック
+
+- SwiftUI（iOS 17+）
+- AVAudioEngine（低レイテンシ音声再生）
+- PeerClock ライブラリ（P2P 同期 + コマンド配信）
+- xcodegen（プロジェクト生成）
+
+## ファイル構成
+
+```
+App/PeerClockMetronome/
+├── project.yml                         xcodegen 定義
+├── Sources/
+│   ├── PeerClockMetronomeApp.swift     @main エントリポイント
+│   ├── Model/
+│   │   └── MetronomeConfig.swift       BPM, subdivision, beatsPerBar
+│   ├── Service/
+│   │   ├── ClickSynthesizer.swift      AVAudioEngine でクリック音生成・再生
+│   │   ├── MetronomeEngine.swift       拍タイミング計算 + スケジューラ
+│   │   └── PeerMetronomeService.swift  PeerClock 連携（BPM 同期・ピア管理）
+│   ├── ViewModel/
+│   │   └── MetronomeViewModel.swift    @Observable @MainActor: UI状態集約
+│   └── View/
+│       ├── MetronomeView.swift         ルートビュー
+│       ├── BPMDisplay.swift            BPM 表示 + ジェスチャー調整
+│       ├── SubdivisionPicker.swift     サブディビジョン選択 UI
+│       └── BeatIndicator.swift         ビート位置ドットインジケーター
+└── Resources/
+    └── (empty)
+```
+
+## 実装計画
+
+### Phase 1: 単体メトロノーム（同期なし）
+
+#### Step 0: プロジェクト基盤（20分）
+- [ ] `project.yml` 作成（PeerClock 依存含む）
+- [ ] `xcodegen generate` → ビルド確認
+- [ ] ディレクトリ構成作成
+
+#### Step 1: MetronomeConfig モデル（10分）
+- [ ] `MetronomeConfig.swift`
+  ```swift
+  struct MetronomeConfig: Sendable, Equatable {
+      var bpm: Int = 120          // 30〜300
+      var subdivision: Subdivision = .none
+      var beatsPerBar: Int = 4
+  }
+  enum Subdivision: Int, Sendable, CaseIterable {
+      case none = 1
+      case half = 2    // 1/2（8分音符）
+      case triplet = 3 // 1/3（3連符）
+      case quarter = 4 // 1/4（16分音符）
+  }
+  ```
+
+#### Step 2: ClickSynthesizer — 音声エンジン（60分）
+- [ ] `ClickSynthesizer.swift` — AVAudioEngine ベース
+  - `AVAudioEngine` + `AVAudioPlayerNode` + `AVAudioPCMBuffer`
+  - 3種のクリック音をメモリ上に事前生成（サイン波バースト）:
+    - 強: 1000Hz, 20ms, amplitude 1.0
+    - 中: 800Hz, 15ms, amplitude 0.7
+    - 弱: 600Hz, 10ms, amplitude 0.4
+  - `func scheduleClick(_ type: ClickType, at: AVAudioTime)` — 正確な時刻にスケジュール
+  - ルックアヘッド: 2〜3 拍先までバッファスケジュール（OS ジッター耐性）
+  - `outputLatency` 補正: `AVAudioSession.sharedInstance().outputLatency` を減算
+  - AudioSession カテゴリ: `.playback`, mode: `.default`, options: `.mixWithOthers`
+  - AudioSession interruption 通知のハンドリング（電話着信等）
+
+#### Step 3: MetronomeEngine — 拍スケジューラ（60分）
+- [ ] `MetronomeEngine.swift` — actor
+  - `var config: MetronomeConfig`
+  - `var isPlaying: Bool`
+  - `func start()` — ルックアヘッドループ起動
+  - 拍タイミング計算: `beatIntervalNs = 60_000_000_000 / bpm`
+  - サブディビジョン: `subIntervalNs = beatIntervalNs / subdivision.rawValue`
+  - ルックアヘッド方式: 100ms 周期で次 2〜3 拍を ClickSynthesizer にスケジュール
+  - コールバック: `var onTick: ((TickType, Int) -> Void)?`（UI フラッシュ用）
+    - `TickType`: `.downbeat`, `.beat`, `.subdivision`
+    - `Int`: ビート番号（0-based）
+  - busy-wait 不要（scheduleBuffer が正確な再生を保証）
+
+#### Step 4: MetronomeViewModel（30分）
+- [ ] `MetronomeViewModel.swift` — `@Observable @MainActor`
+  - `var config: MetronomeConfig`
+  - `var isPlaying: Bool`
+  - `var currentBeat: Int` — 現在のビート位置（0-based）
+  - `var flashIntensity: Double` — フラッシュの強さ（0〜1）
+  - `var peerCount: Int`
+  - `func togglePlay()`
+  - `func setBPM(_ bpm: Int)`
+  - `func setSubdivision(_ sub: Subdivision)`
+  - Engine の onTick を受けて UI 状態を更新
+
+#### Step 5: View レイヤー（60分）
+- [ ] `MetronomeView.swift` — ルートビュー + 背景フラッシュ
+- [ ] `BPMDisplay.swift` — 大きい BPM 数字 + DragGesture で調整
+- [ ] `SubdivisionPicker.swift` — 4つのボタン（なし/2/3/4）
+- [ ] `BeatIndicator.swift` — ドットで現在ビート位置を表示
+
+#### Step 6: 統合確認（20分）
+- [ ] 実機ビルド & 動作確認
+- [ ] クリック音が正確なタイミングで鳴ること
+- [ ] BPM 変更がスムーズに反映されること
+- [ ] サブディビジョン切替が正しく動作すること
+- [ ] バックグラウンド移行時に停止すること
+
+### Phase 2: P2P 同期
+
+#### Step 7: PeerMetronomeService（45分）
+- [ ] `PeerMetronomeService.swift` — PeerClock 連携
+  - `PeerClock()` 起動、ピア自動発見
+  - `PeerClock.now` を MetronomeEngine に供給
+  - BPM/subdivision 変更時:
+    - `applyAtNs` を計算（now + 500ms 以降の最初のダウンビート）
+    - `broadcast(Command(type: "config", payload: {config, applyAtNs}))` 
+  - コマンド受信時: `applyAtNs` から新 config を適用
+  - 新ピア接続時: 現在の config + 再生状態を push
+  - ピア数監視
+
+#### Step 8: 同期スケジューリング（45分）
+- [ ] MetronomeEngine を PeerClock.now ベースに拡張
+  - `now % beatIntervalNs` で次のビートまでの残り時間を計算
+  - 全端末が同じ `now` と同じ `beatIntervalNs` を持つ → 自動同期
+  - BPM 変更時: 次のダウンビートから新 BPM を適用（途中で変わらない）
+  - 基準時刻: `epochNs = 0`（全端末で共通の固定基準）
+
+#### Step 9: 統合テスト（30分）
+- [ ] 2台で同時クリックが聞こえること（動画で証明）
+- [ ] 片方で BPM 変更 → もう一方に即座に反映
+- [ ] 途中参加: 新しいピアが接続 → 現在の BPM で即座に同期
+- [ ] Offline: ピア切断後も自分のメトロノームは継続
+
+## 技術的注意点・リスク
+
+- [ ] **音響遅延補正**: デバイスモデルごとに `outputLatency` が 5〜20ms 異なる。`AVAudioSession.outputLatency` で補正必須（Issue #9）
+- [ ] **BPM 変更の合意形成**: `applyAtNs` を絶対時刻で共有。ネットワーク遅延による解釈不一致を防止（Issue #8）
+- [ ] **スケジューリング**: `scheduleBuffer(at: AVAudioTime)` + ルックアヘッド方式。busy-wait 不要
+- [ ] **AudioSession**: `.playback` + `.mixWithOthers` で他アプリと共存。interruption 通知をハンドル
+- [ ] **バックグラウンド再生**: Background Audio entitlement が必要な場合あり（Phase 2 以降で検討）
+- [ ] **新ピア接続**: 途中参加ピアに現在の config + 再生状態を即時 push
+
+## やらないこと
+
+- ❌ 拍子記号のカスタマイズ（4/4 固定）
+- ❌ アクセントパターン
+- ❌ 音色選択
+- ❌ テンポカーブ / 加速
+- ❌ 録音機能
+- ❌ MIDI 出力
+
+## 成功基準
+
+- [ ] 2台並べてクリックが完全に揃うこと（動画で証明）
+- [ ] BPM 40〜240 で安定動作（ジッター <2ms）
+- [ ] サブディビジョン切替が即座に反映
+- [ ] PeerClock GitHub への流入
