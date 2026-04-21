@@ -6,6 +6,7 @@ struct NTPStatusPanel: View {
     let ntpOffset: TimeInterval?
     let rtt: TimeInterval?
     let stratum: Int?
+    var peerCount: Int = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -29,6 +30,9 @@ struct NTPStatusPanel: View {
             }
             if let stratum {
                 row("Stratum", "\(stratum)")
+            }
+            if peerCount > 0 {
+                row("Peers", "\(peerCount) connected")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
