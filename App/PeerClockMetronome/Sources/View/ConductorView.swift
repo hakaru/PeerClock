@@ -38,16 +38,39 @@ struct ConductorView: View {
     // MARK: - Canvas Drawing
 
     private func drawPath(context: GraphicsContext, points: [ConductorPathProvider.BeatPoint]) {
-        let path = ConductorPathProvider.buildPath(from: points)
+        let count = points.count
+        guard count >= 2 else { return }
 
-        // Outer glow
-        var glowCtx = context
-        glowCtx.opacity = 0.06
-        glowCtx.addFilter(.blur(radius: 4))
-        glowCtx.stroke(path, with: .color(.cyan), lineWidth: 8)
+        var maxAbsDy: CGFloat = 1
+        for i in 0..<count {
+            let dy = points[(i + 1) % count].position.y - points[i].position.y
+            maxAbsDy = max(maxAbsDy, abs(dy))
+        }
 
-        // Main line
-        context.stroke(path, with: .color(.cyan.opacity(0.2)), lineWidth: 1.5)
+        for i in 0..<count {
+            let from = points[i]
+            let to = points[(i + 1) % count]
+
+            var seg = Path()
+            seg.move(to: from.position)
+            seg.addCurve(
+                to: to.position,
+                control1: from.controlOut ?? from.position,
+                control2: to.controlIn ?? to.position
+            )
+
+            let dy = to.position.y - from.position.y
+            let weight = max(0.2, min(1.0, 0.5 + (dy / maxAbsDy) * 0.5))
+            let lineWidth = 1.5 + weight * 4.5
+            let style = StrokeStyle(lineWidth: lineWidth, lineCap: .round)
+
+            var glowCtx = context
+            glowCtx.opacity = 0.03 + weight * 0.05
+            glowCtx.addFilter(.blur(radius: 3 + weight * 5))
+            glowCtx.stroke(seg, with: .color(.cyan), style: StrokeStyle(lineWidth: lineWidth * 3, lineCap: .round))
+
+            context.stroke(seg, with: .color(.cyan.opacity(0.15 + weight * 0.25)), style: style)
+        }
     }
 
     private func drawBeatPoints(context: GraphicsContext, points: [ConductorPathProvider.BeatPoint]) {
@@ -65,8 +88,10 @@ struct ConductorView: View {
                 ringCtx.stroke(Circle().path(in: ringRect), with: .color(.cyan), lineWidth: 2)
             }
 
-            let dotSize: CGFloat = isActive ? 10 : (isDownbeat ? 8 : 6)
-            let color: Color = isActive ? .white : (isDownbeat ? .cyan.opacity(0.5) : .white.opacity(0.15))
+            let beatCount = points.compactMap(\.beatIndex).count
+            let scale: CGFloat = isDownbeat ? 1.0 : CGFloat(beatCount - beat) / CGFloat(beatCount)
+            let dotSize: CGFloat = isActive ? 10 : (4 + 4 * scale)
+            let color: Color = isActive ? .white : .cyan.opacity(0.2 + 0.4 * scale)
             let dotRect = CGRect(x: pt.x - dotSize / 2, y: pt.y - dotSize / 2, width: dotSize, height: dotSize)
             context.fill(Circle().path(in: dotRect), with: .color(color))
 
