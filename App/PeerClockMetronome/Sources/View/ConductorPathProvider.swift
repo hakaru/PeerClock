@@ -5,6 +5,14 @@ struct ConductorPathProvider {
         let position: CGPoint
         let controlIn: CGPoint?
         let controlOut: CGPoint?
+        let beatIndex: Int?
+
+        init(position: CGPoint, controlIn: CGPoint?, controlOut: CGPoint?, beatIndex: Int? = nil) {
+            self.position = position
+            self.controlIn = controlIn
+            self.controlOut = controlOut
+            self.beatIndex = beatIndex
+        }
     }
 
     static func points(for beatsPerBar: Int, in size: CGSize) -> [BeatPoint] {
@@ -17,74 +25,83 @@ struct ConductorPathProvider {
         }
     }
 
-    // 2拍子: 1(中央底) → 跳ね上がり → 2(上)
-    // ループ: 2(上) → 振り下ろし → 1(底)
     private static func twoPattern(w: CGFloat, h: CGFloat) -> [BeatPoint] {
         [
             BeatPoint(
-                position: p(0.50, 0.88, w, h),       // 拍1: 中央底
-                controlIn: p(0.50, 0.45, w, h),      // 上から真下に振り下ろし
-                controlOut: p(0.60, 0.55, w, h)       // 跳ね上がり右へ
+                position: p(0.50, 0.88, w, h),
+                controlIn: p(0.50, 0.45, w, h),
+                controlOut: p(0.60, 0.55, w, h),
+                beatIndex: 0
             ),
             BeatPoint(
-                position: p(0.55, 0.18, w, h),       // 拍2: 上
-                controlIn: p(0.68, 0.30, w, h),      // 右カーブから上へ
-                controlOut: p(0.50, 0.15, w, h)       // 上→下の振り下ろし準備
+                position: p(0.55, 0.18, w, h),
+                controlIn: p(0.68, 0.30, w, h),
+                controlOut: p(0.50, 0.15, w, h),
+                beatIndex: 1
             ),
         ]
     }
 
-    // 3拍子: 1(中央底) → 跳ね上がり → 2(右底) → 跳ね上がり → 3(上)
-    // ループ: 3(上) → 振り下ろし → 1(底)
     private static func threePattern(w: CGFloat, h: CGFloat) -> [BeatPoint] {
         [
             BeatPoint(
-                position: p(0.45, 0.88, w, h),       // 拍1: 中央底
-                controlIn: p(0.45, 0.45, w, h),      // 上から真下に振り下ろし
-                controlOut: p(0.55, 0.50, w, h)       // 跳ね上がり→右下へ
+                position: p(0.45, 0.88, w, h),
+                controlIn: p(0.45, 0.45, w, h),
+                controlOut: p(0.55, 0.50, w, h),
+                beatIndex: 0
             ),
             BeatPoint(
-                position: p(0.75, 0.82, w, h),       // 拍2: 右底
-                controlIn: p(0.70, 0.65, w, h),      // 上から右下に着地
-                controlOut: p(0.72, 0.50, w, h)       // 跳ね上がり→左上へ
+                position: p(0.75, 0.82, w, h),
+                controlIn: p(0.70, 0.65, w, h),
+                controlOut: p(0.72, 0.50, w, h),
+                beatIndex: 1
             ),
             BeatPoint(
-                position: p(0.45, 0.18, w, h),       // 拍3: 上
-                controlIn: p(0.58, 0.22, w, h),      // 右上からカーブ
-                controlOut: p(0.42, 0.15, w, h)       // 上→下の振り下ろし準備
+                position: p(0.45, 0.18, w, h),
+                controlIn: p(0.58, 0.22, w, h),
+                controlOut: p(0.42, 0.15, w, h),
+                beatIndex: 2
             ),
         ]
     }
 
-    // 4拍子: 1(中央底) → 跳ね上がり → 2(左底) → 跳ね上がり → 3(右底) → 跳ね上がり → 4(上)
-    // ループ: 4(上) → 振り下ろし → 1(底)
+    // 4拍子: 1→上→左下→2→左端ループ→底→右→下から3→内側→4→振り下ろし→1
     private static func fourPattern(w: CGFloat, h: CGFloat) -> [BeatPoint] {
         [
             BeatPoint(
-                position: p(0.48, 0.88, w, h),       // 拍1: 中央底
-                controlIn: p(0.48, 0.45, w, h),      // 上から真下に振り下ろし
-                controlOut: p(0.38, 0.50, w, h)       // 跳ね上がり→左下へ
+                position: p(0.48, 0.92, w, h),       // 拍1: 最下部
+                controlIn: p(0.48, 0.50, w, h),
+                controlOut: p(0.35, 0.38, w, h),
+                beatIndex: 0
             ),
             BeatPoint(
-                position: p(0.20, 0.82, w, h),       // 拍2: 左底
-                controlIn: p(0.25, 0.62, w, h),      // 上から左下に着地
-                controlOut: p(0.28, 0.48, w, h)       // 跳ね上がり→右下へ
+                position: p(0.30, 0.82, w, h),       // 拍2: 少し上
+                controlIn: p(0.38, 0.58, w, h),
+                controlOut: p(0.22, 0.95, w, h),
+                beatIndex: 1
             ),
             BeatPoint(
-                position: p(0.78, 0.78, w, h),       // 拍3: 右底
-                controlIn: p(0.65, 0.58, w, h),      // 中央上からクロスして右下に着地
-                controlOut: p(0.75, 0.45, w, h)       // 跳ね上がり→上へ
+                position: p(0.48, 0.88, w, h),       // 中間: 左ループ後の底
+                controlIn: p(-0.05, 0.50, w, h),
+                controlOut: p(0.65, 0.92, w, h),
+                beatIndex: nil
+            ),
+            BeatPoint(
+                position: p(0.78, 0.72, w, h),       // 拍3: 右（少し上）
+                controlIn: p(0.72, 0.85, w, h),
+                controlOut: p(0.78, 0.90, w, h),      // 真下へ垂れる（3より右に行かない）
+                beatIndex: 2
             ),
             BeatPoint(
                 position: p(0.50, 0.18, w, h),       // 拍4: 上
-                controlIn: p(0.60, 0.22, w, h),      // 右上からカーブ
-                controlOut: p(0.48, 0.15, w, h)       // 上→下の振り下ろし準備
+                controlIn: p(0.50, 0.60, w, h),      // 真下から上がる（4より左に行かない）
+                controlOut: p(0.48, 0.15, w, h),
+                beatIndex: 3
             ),
         ]
     }
 
-    static func path(for beatsPerBar: Int, in size: CGSize) -> Path {
-        let pts = points(for: beatsPerBar, in: size)
+    static func buildPath(from pts: [BeatPoint]) -> Path {
         var path = Path()
         guard pts.count >= 2 else { return path }
 
@@ -96,8 +113,7 @@ struct ConductorPathProvider {
         return path
     }
 
-    static func interpolatePosition(progress: Double, size: CGSize, beatsPerBar: Int) -> CGPoint {
-        let pts = points(for: beatsPerBar, in: size)
+    static func interpolatePosition(progress: Double, points pts: [BeatPoint]) -> CGPoint {
         let count = pts.count
         guard count >= 2 else { return .zero }
 
@@ -106,11 +122,12 @@ struct ConductorPathProvider {
         let index = Int(floor(segmentProgress))
         let t = segmentProgress - Double(index)
 
+        let eased = t * t * (3.0 - 2.0 * t)
         let from = pts[index % count]
         let to = pts[(index + 1) % count]
         let cp1 = from.controlOut ?? from.position
         let cp2 = to.controlIn ?? to.position
-        return cubicBezier(t: t, p0: from.position, p1: cp1, p2: cp2, p3: to.position)
+        return cubicBezier(t: eased, p0: from.position, p1: cp1, p2: cp2, p3: to.position)
     }
 
     private static func addSegment(to path: inout Path, from start: BeatPoint, to end: BeatPoint) {

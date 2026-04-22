@@ -27,6 +27,7 @@ targets:
         UIRequiredDeviceCapabilities: [arm64]
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         NSLocalNetworkUsageDescription: PeerClock Metronome uses local network to sync with nearby devices
+        NSMotionUsageDescription: PeerClock Metronome reads motion data to detect conducting gestures for real-time tempo control
         NSBonjourServices:
           - _peerclock._tcp
           - _peerclock._udp
@@ -39,3 +40,4 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_STRICT_CONCURRENCY: complete
         SWIFT_VERSION: "6.0"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

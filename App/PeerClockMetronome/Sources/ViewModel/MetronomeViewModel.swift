@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Observation
 
@@ -15,6 +16,7 @@ final class MetronomeViewModel {
 
     private let engine = MetronomeEngine()
     private let peerService = PeerMetronomeService()
+    private var streamTasks: [Task<Void, Never>] = []
 
     func setup() async {
         await engine.setOnTick { [weak self] tickType, beatIndex in
@@ -31,49 +33,60 @@ final class MetronomeViewModel {
             }
         }
 
-        // Connect PeerClock sync provider
-        let service = peerService
-        await engine.setSyncProvider {
-            return service.syncedNow
-        }
-
-        // Handle incoming config from peers
-        peerService.onConfigReceived = { [weak self] config, applyAtNs in
-            guard let self else { return }
-            self.bpm = config.bpm
-            self.timeSignature = config.timeSignature
-            Task {
-                await self.engine.updateConfigAt(config, applyAtNs: applyAtNs)
-            }
-        }
-
-        // Handle incoming play/stop from peers
-        peerService.onPlayReceived = { [weak self] playing in
-            guard let self else { return }
-            Task {
-                if playing && !self.isPlaying {
-                    await self.syncConfig()
-                    do {
-                        try await self.engine.start()
-                        self.isPlaying = true
-                    } catch {}
-                } else if !playing && self.isPlaying {
-                    await self.engine.stop()
-                    self.isPlaying = false
-                    self.flashIntensity = 0
-                }
-            }
-        }
-
         await peerService.start()
 
-        // Poll peer count and sync state
-        Task {
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(500))
-                self.peerCount = self.peerService.peerCount
-                self.syncState = self.peerService.syncState
-                self.debugStatus = self.peerService.debugStatus
+        if let timebase = await peerService.getTimebase() {
+            await engine.setSyncProvider {
+                timebase.syncedNow()
+            }
+        }
+
+        let snapshots = peerService.snapshots
+        streamTasks.append(Task { [weak self] in
+            for await snap in snapshots {
+                await MainActor.run {
+                    guard let self else { return }
+                    self.peerCount = snap.peerCount
+                    self.syncState = snap.syncState
+                    self.debugStatus = snap.debugStatus
+                }
+            }
+        })
+
+        let configEvents = peerService.configEvents
+        streamTasks.append(Task { [weak self] in
+            for await (config, applyAtNs) in configEvents {
+                guard let self else { return }
+                await self.engine.updateConfigAt(config, applyAtNs: applyAtNs)
+                await MainActor.run {
+                    self.bpm = config.bpm
+                    self.timeSignature = config.timeSignature
+                }
+            }
+        })
+
+        let playEvents = peerService.playEvents
+        streamTasks.append(Task { [weak self] in
+            for await playing in playEvents {
+                guard let self else { return }
+                await self.handleRemotePlay(playing)
+            }
+        })
+    }
+
+    private func handleRemotePlay(_ playing: Bool) async {
+        let currentlyPlaying = await MainActor.run { self.isPlaying }
+        if playing && !currentlyPlaying {
+            await syncConfig()
+            do {
+                try await engine.start()
+                await MainActor.run { self.isPlaying = true }
+            } catch {}
+        } else if !playing && currentlyPlaying {
+            await engine.stop()
+            await MainActor.run {
+                self.isPlaying = false
+                self.flashIntensity = 0
             }
         }
     }
@@ -83,7 +96,7 @@ final class MetronomeViewModel {
             await engine.stop()
             isPlaying = false
             flashIntensity = 0
-            if peerService.hasPeers {
+            if await peerService.hasPeers {
                 await peerService.broadcastPlay(false)
             }
         } else {
@@ -91,7 +104,7 @@ final class MetronomeViewModel {
             do {
                 try await engine.start()
                 isPlaying = true
-                if peerService.hasPeers {
+                if await peerService.hasPeers {
                     await peerService.broadcastPlay(true)
                 }
             } catch {
@@ -106,7 +119,7 @@ final class MetronomeViewModel {
         let config = makeConfig()
         let applyAt = await engine.nextDownbeatApplyTime()
         await engine.updateConfigAt(config, applyAtNs: applyAt)
-        if peerService.hasPeers {
+        if await peerService.hasPeers {
             await peerService.broadcastConfig(config, applyAtNs: applyAt)
         }
     }
@@ -116,7 +129,7 @@ final class MetronomeViewModel {
         let config = makeConfig()
         let applyAt = await engine.nextDownbeatApplyTime()
         await engine.updateConfigAt(config, applyAtNs: applyAt)
-        if peerService.hasPeers {
+        if await peerService.hasPeers {
             await peerService.broadcastConfig(config, applyAtNs: applyAt)
         }
     }

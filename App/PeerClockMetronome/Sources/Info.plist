@@ -27,6 +27,8 @@
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>PeerClock Metronome uses local network to sync with nearby devices</string>
+	<key>NSMotionUsageDescription</key>
+	<string>PeerClock Metronome reads motion data to detect conducting gestures for real-time tempo control</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UIRequiredDeviceCapabilities</key>

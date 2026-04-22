@@ -1,10 +1,16 @@
 import AVFoundation
 import Darwin
 
+enum EngineMode: Sendable {
+    case internalAuto
+    case external
+}
+
 actor MetronomeEngine {
     private let synthesizer = ClickSynthesizer()
     private var config = MetronomeConfig()
     private var isPlaying = false
+    private var mode: EngineMode = .internalAuto
     private var schedulerTask: Task<Void, Never>?
     private var currentSubBeat: Int = 0
     private var nextBeatHostTime: UInt64 = 0
@@ -35,6 +41,7 @@ actor MetronomeEngine {
         guard !isPlaying else { return }
         try synthesizer.start()
         isPlaying = true
+        mode = .internalAuto
         currentSubBeat = 0
 
         if syncedNowProvider != nil {
@@ -45,6 +52,69 @@ actor MetronomeEngine {
 
         startSchedulerLoop()
     }
+
+    /// Enter External mode: synthesizer ready, no auto-scheduling.
+    /// Conductor or remote BeatEvents drive playback via playExternalBeat.
+    func startExternal() throws {
+        if !isPlaying {
+            try synthesizer.start()
+            isPlaying = true
+        }
+        mode = .external
+        schedulerTask?.cancel()
+        schedulerTask = nil
+    }
+
+    /// Schedule a single click at the given host time. Used in External mode.
+    func playExternalBeat(hostTime: UInt64, beatIndex: Int, tickType: TickType) {
+        guard isPlaying, mode == .external else { return }
+        let audioTime = AVAudioTime(hostTime: hostTime)
+        synthesizer.scheduleClick(tickType, at: audioTime)
+        onTick?(tickType, beatIndex)
+    }
+
+    /// Resume Internal auto-scheduling with phase inherited from the last external beat.
+    /// - anchorHostTime: host time of the most recent played external beat
+    /// - anchorBeatIndex: beat-in-bar of that beat (0-based)
+    /// - beatIntervalNs: desired beat interval after resume (derived from last BPM)
+    /// - resumeHostTime: current host time (future beats must be > this)
+    func resumeInternalFromExternal(anchorHostTime: UInt64,
+                                    anchorBeatIndex: Int,
+                                    beatIntervalNs: UInt64,
+                                    resumeHostTime: UInt64 = mach_absolute_time()) {
+        guard beatIntervalNs > 0 else { return }
+
+        // Derive a matching config (same time signature, new BPM from interval)
+        let beatIntervalSec = Double(beatIntervalNs) / 1_000_000_000
+        let bpm = max(30, min(300, Int((60.0 / beatIntervalSec).rounded())))
+        config = MetronomeConfig(bpm: bpm, timeSignature: config.timeSignature)
+
+        let subsPerBeat = config.subdivisionsPerBeat
+        let totalSubs = config.totalSubsPerBar
+        let beatIntervalMach = nsToMach(beatIntervalNs)
+        let subIntervalMach = beatIntervalMach / UInt64(subsPerBeat)
+        let schedulingBuffer = nsToMach(20_000_000) // 20ms safety
+
+        // Next beat starts 1 beat after the anchor. Advance until future.
+        var nextBeatTime = anchorHostTime + beatIntervalMach
+        var nextBeatIdx = (anchorBeatIndex + 1) % config.beatsPerBar
+        let minFuture = resumeHostTime + schedulingBuffer
+
+        while nextBeatTime < minFuture {
+            nextBeatTime += beatIntervalMach
+            nextBeatIdx = (nextBeatIdx + 1) % config.beatsPerBar
+        }
+
+        mode = .internalAuto
+        currentSubBeat = nextBeatIdx * subsPerBeat
+        nextBeatHostTime = nextBeatTime
+        // Suppress the "past → resync from synced clock" branch in scheduleUpcoming
+        pendingConfig = nil
+        _ = subIntervalMach  // silence unused warning; subInterval derived in scheduleUpcoming
+        startSchedulerLoop()
+    }
+
+    func getMode() -> EngineMode { mode }
 
     func stop() {
         isPlaying = false
@@ -150,6 +220,7 @@ actor MetronomeEngine {
     }
 
     private func scheduleUpcoming() {
+        guard mode == .internalAuto else { return }
         let now = mach_absolute_time()
         let lookaheadNs: UInt64 = 150_000_000
         let horizon = now + nsToMach(lookaheadNs)

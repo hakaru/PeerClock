@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <!-- Cyan glow filter -->
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="12" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+    <filter id="glowStrong" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="24" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+    <filter id="dotGlow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+    <!-- Background gradient -->
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0a0a1a"/>
+      <stop offset="50%" stop-color="#0d1428"/>
+      <stop offset="100%" stop-color="#0a0a1a"/>
+    </linearGradient>
+    <!-- Radial glow behind path -->
+    <radialGradient id="centerGlow" cx="0.5" cy="0.5" r="0.45">
+      <stop offset="0%" stop-color="#00cccc" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#00cccc" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1024" height="1024" rx="230" fill="url(#bgGrad)"/>
+
+  <!-- Subtle center glow -->
+  <rect width="1024" height="1024" rx="230" fill="url(#centerGlow)"/>
+
+  <!-- Conductor path: 4-beat pattern -->
+  <!-- Beat 1 (center-bottom) → 2 (left-bottom) → 3 (right-bottom) → 4 (top) → back to 1 -->
+  <!-- Scaled from normalized coords to 1024, with padding (offset 112, scale 800) -->
+
+  <!-- Outer glow layer -->
+  <path d="M 496,816
+           C 416,512  312,608  272,768
+           C 336,496  632,560  736,736
+           C 712,472  592,288  512,240
+           C 496,208  496,472  496,816 Z"
+        fill="none" stroke="#00e5ff" stroke-opacity="0.12" stroke-width="28"
+        stroke-linecap="round" stroke-linejoin="round"
+        filter="url(#glowStrong)"/>
+
+  <!-- Main path -->
+  <path d="M 496,816
+           C 416,512  312,608  272,768
+           C 336,496  632,560  736,736
+           C 712,472  592,288  512,240
+           C 496,208  496,472  496,816 Z"
+        fill="none" stroke="#00e5ff" stroke-opacity="0.5" stroke-width="6"
+        stroke-linecap="round" stroke-linejoin="round"
+        filter="url(#glow)"/>
+
+  <!-- Inner bright path -->
+  <path d="M 496,816
+           C 416,512  312,608  272,768
+           C 336,496  632,560  736,736
+           C 712,472  592,288  512,240
+           C 496,208  496,472  496,816 Z"
+        fill="none" stroke="#80f0ff" stroke-opacity="0.7" stroke-width="2.5"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Beat point 1 (downbeat - center bottom) - brightest -->
+  <circle cx="496" cy="816" r="14" fill="#00e5ff" opacity="0.3" filter="url(#dotGlow)"/>
+  <circle cx="496" cy="816" r="8" fill="#ffffff" opacity="0.9"/>
+
+  <!-- Beat point 2 (left bottom) -->
+  <circle cx="272" cy="768" r="10" fill="#00e5ff" opacity="0.2" filter="url(#dotGlow)"/>
+  <circle cx="272" cy="768" r="5" fill="#80f0ff" opacity="0.6"/>
+
+  <!-- Beat point 3 (right bottom) -->
+  <circle cx="736" cy="736" r="10" fill="#00e5ff" opacity="0.2" filter="url(#dotGlow)"/>
+  <circle cx="736" cy="736" r="5" fill="#80f0ff" opacity="0.6"/>
+
+  <!-- Beat point 4 (top) -->
+  <circle cx="512" cy="240" r="10" fill="#00e5ff" opacity="0.2" filter="url(#dotGlow)"/>
+  <circle cx="512" cy="240" r="5" fill="#80f0ff" opacity="0.6"/>
+
+  <!-- Tracking dot (on the path, near beat 1 position for visual impact) -->
+  <circle cx="420" cy="580" r="20" fill="#00e5ff" opacity="0.15" filter="url(#glowStrong)"/>
+  <circle cx="420" cy="580" r="10" fill="#00e5ff" opacity="0.4" filter="url(#dotGlow)"/>
+  <circle cx="420" cy="580" r="5" fill="#ffffff"/>
+
+</svg>
