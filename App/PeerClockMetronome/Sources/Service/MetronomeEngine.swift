@@ -142,13 +142,10 @@ actor MetronomeEngine {
                 pendingApplyAtHost = hostNow + nsToMach(deltaNs)
             } else {
                 config = newConfig
-                currentSubBeat = 0
                 calculateNextBeatFromSyncedClock()
             }
         } else if isPlaying {
-            // スタンドアロン再生中: 次のダウンビートで適用
-            pendingConfig = newConfig
-            pendingApplyAtHost = nextDownbeatHostTime()
+            config = newConfig
         } else {
             config = newConfig
             currentSubBeat = 0
@@ -180,40 +177,11 @@ actor MetronomeEngine {
         return max(0, min(0.999, progress))
     }
 
-    /// Calculate applyAtNs: next downbeat after now + 500ms (synced clock ns).
-    /// Returns 0 in standalone mode — callers should use updateConfigAt which handles standalone internally.
+    /// Calculate applyAtNs for synced BPM change: now + 200ms.
+    /// Returns 0 in standalone mode.
     func nextDownbeatApplyTime() -> UInt64 {
         guard let provider = syncedNowProvider else { return 0 }
-        let now = provider()
-        let beatIntervalNs = UInt64(config.beatIntervalSeconds * 1_000_000_000)
-        let barIntervalNs = beatIntervalNs * UInt64(config.beatsPerBar)
-        let target = now + 500_000_000 // 500ms from now
-        let nextBar = ((target / barIntervalNs) + 1) * barIntervalNs
-        return nextBar
-    }
-
-    /// Standalone mode: host time of the next downbeat (subBeat == 0).
-    private func nextDownbeatHostTime() -> UInt64 {
-        let now = mach_absolute_time()
-        let subIntervalNs = UInt64(config.subIntervalSeconds * 1_000_000_000)
-        guard subIntervalNs > 0, nextBeatHostTime > 0 else {
-            return now + nsToMach(500_000_000)
-        }
-        let subIntervalMach = nsToMach(subIntervalNs)
-        let totalSubsPerBar = config.totalSubsPerBar
-
-        // Walk forward from the scheduled next beat to find the next downbeat
-        var t = nextBeatHostTime
-        var sub = currentSubBeat
-        for _ in 0 ..< (totalSubsPerBar * 2) {
-            if sub % totalSubsPerBar == 0 && t > now + nsToMach(20_000_000) {
-                return t
-            }
-            t += subIntervalMach
-            sub = (sub + 1) % totalSubsPerBar
-        }
-        // Fallback: 500ms from now
-        return now + nsToMach(500_000_000)
+        return provider() + 200_000_000
     }
 
     private func calculateNextBeatFromSyncedClock() {
@@ -254,15 +222,11 @@ actor MetronomeEngine {
         let lookaheadNs: UInt64 = 150_000_000
         let horizon = now + nsToMach(lookaheadNs)
 
-        // Apply pending config if its time has arrived
         if let pending = pendingConfig, now >= pendingApplyAtHost {
             config = pending
             pendingConfig = nil
-            currentSubBeat = 0
             if syncedNowProvider != nil {
                 calculateNextBeatFromSyncedClock()
-            } else {
-                nextBeatHostTime = pendingApplyAtHost
             }
         }
 

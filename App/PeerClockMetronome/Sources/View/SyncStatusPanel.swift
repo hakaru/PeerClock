@@ -16,7 +16,7 @@ struct SyncStatusPanel: View {
                 .foregroundStyle(statusColor)
 
             if case .synced(let offsetMs, _) = syncState {
-                Text(String(format: "%+.1fms", offsetMs))
+                Text(String(format: "±%.1fms", offsetMs))
                     .font(.system(size: 11, weight: .regular, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.3))
             }
