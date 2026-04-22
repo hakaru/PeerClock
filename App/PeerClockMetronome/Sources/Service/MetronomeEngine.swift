@@ -145,6 +145,10 @@ actor MetronomeEngine {
                 currentSubBeat = 0
                 calculateNextBeatFromSyncedClock()
             }
+        } else if isPlaying {
+            // スタンドアロン再生中: 次のダウンビートで適用
+            pendingConfig = newConfig
+            pendingApplyAtHost = nextDownbeatHostTime()
         } else {
             config = newConfig
             currentSubBeat = 0
@@ -176,7 +180,8 @@ actor MetronomeEngine {
         return max(0, min(0.999, progress))
     }
 
-    /// Calculate applyAtNs: next downbeat after now + 500ms
+    /// Calculate applyAtNs: next downbeat after now + 500ms (synced clock ns).
+    /// Returns 0 in standalone mode — callers should use updateConfigAt which handles standalone internally.
     func nextDownbeatApplyTime() -> UInt64 {
         guard let provider = syncedNowProvider else { return 0 }
         let now = provider()
@@ -185,6 +190,30 @@ actor MetronomeEngine {
         let target = now + 500_000_000 // 500ms from now
         let nextBar = ((target / barIntervalNs) + 1) * barIntervalNs
         return nextBar
+    }
+
+    /// Standalone mode: host time of the next downbeat (subBeat == 0).
+    private func nextDownbeatHostTime() -> UInt64 {
+        let now = mach_absolute_time()
+        let subIntervalNs = UInt64(config.subIntervalSeconds * 1_000_000_000)
+        guard subIntervalNs > 0, nextBeatHostTime > 0 else {
+            return now + nsToMach(500_000_000)
+        }
+        let subIntervalMach = nsToMach(subIntervalNs)
+        let totalSubsPerBar = config.totalSubsPerBar
+
+        // Walk forward from the scheduled next beat to find the next downbeat
+        var t = nextBeatHostTime
+        var sub = currentSubBeat
+        for _ in 0 ..< (totalSubsPerBar * 2) {
+            if sub % totalSubsPerBar == 0 && t > now + nsToMach(20_000_000) {
+                return t
+            }
+            t += subIntervalMach
+            sub = (sub + 1) % totalSubsPerBar
+        }
+        // Fallback: 500ms from now
+        return now + nsToMach(500_000_000)
     }
 
     private func calculateNextBeatFromSyncedClock() {

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct MetronomeView: View {
     @State private var viewModel = MetronomeViewModel()
+    @State private var showHelp = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -12,6 +13,14 @@ struct MetronomeView: View {
                         .foregroundStyle(.white.opacity(0.2))
                 }
                 Spacer()
+                Button {
+                    showHelp = true
+                } label: {
+                    Image(systemName: "questionmark.circle")
+                        .font(.system(size: 20))
+                        .foregroundStyle(.white.opacity(0.4))
+                }
+                .buttonStyle(.plain)
             }
             .padding(.horizontal, 16)
             .padding(.top, 8)
@@ -77,6 +86,9 @@ struct MetronomeView: View {
                     endRadius: 300
                 )
             }
+        }
+        .sheet(isPresented: $showHelp) {
+            HelpView()
         }
         .task {
             await viewModel.setup()

@@ -215,9 +215,9 @@ actor PeerMetronomeService {
         }
         let snapshot = pc.currentSync
         switch snapshot.state {
-        case .synced(let offset, let quality):
+        case .synced(_, let quality):
             currentSyncState = .synced(
-                offsetMs: offset * 1000,
+                offsetMs: Double(quality.roundTripDelayNs) / 2 / 1_000_000,
                 rttMs: Double(quality.roundTripDelayNs) / 1_000_000
             )
         case .syncing, .discovering, .idle, .error:
