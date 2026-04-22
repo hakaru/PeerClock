@@ -17,8 +17,12 @@ final class MetronomeViewModel {
     private let engine = MetronomeEngine()
     private let peerService = PeerMetronomeService()
     private var streamTasks: [Task<Void, Never>] = []
+    private var flashTask: Task<Void, Never>?
 
     func setup() async {
+        streamTasks.forEach { $0.cancel() }
+        streamTasks.removeAll()
+
         await engine.setOnTick { [weak self] tickType, beatIndex in
             Task { @MainActor in
                 guard let self else { return }
@@ -28,8 +32,12 @@ final class MetronomeViewModel {
                 case .beat: self.flashIntensity = 0.6
                 case .subdivision: self.flashIntensity = 0.25
                 }
-                try? await Task.sleep(for: .milliseconds(80))
-                self.flashIntensity = 0
+                self.flashTask?.cancel()
+                self.flashTask = Task {
+                    try? await Task.sleep(for: .milliseconds(80))
+                    guard !Task.isCancelled else { return }
+                    self.flashIntensity = 0
+                }
             }
         }
 

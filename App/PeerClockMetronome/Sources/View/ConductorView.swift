@@ -7,18 +7,19 @@ struct ConductorView: View {
     let progressProvider: @Sendable () async -> Double
 
     @State private var progress: Double = 0
+    @State private var cachedPoints: [ConductorPathProvider.BeatPoint] = []
+    @State private var cachedSize: CGSize = .zero
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { _ in
-            let _ = updateProgress()
             GeometryReader { geo in
                 let size = geo.size
-                let pts = ConductorPathProvider.points(for: beatsPerBar, in: size)
+                let pts = pointsCached(for: size)
                 let pos = ConductorPathProvider.interpolatePosition(
                     progress: progress, points: pts
                 )
 
-                Canvas { context, canvasSize in
+                Canvas { context, _ in
                     drawPath(context: context, points: pts)
                     drawBeatPoints(context: context, points: pts)
                     if isPlaying {
@@ -27,12 +28,22 @@ struct ConductorView: View {
                 }
             }
         }
+        .task(id: isPlaying) {
+            guard isPlaying else { return }
+            while !Task.isCancelled {
+                progress = await progressProvider()
+            }
+        }
     }
 
-    private func updateProgress() {
-        Task {
-            progress = await progressProvider()
+    private func pointsCached(for size: CGSize) -> [ConductorPathProvider.BeatPoint] {
+        if size == cachedSize && !cachedPoints.isEmpty {
+            return cachedPoints
         }
+        let pts = ConductorPathProvider.points(for: beatsPerBar, in: size)
+        cachedSize = size
+        cachedPoints = pts
+        return pts
     }
 
     // MARK: - Canvas Drawing
@@ -47,6 +58,25 @@ struct ConductorView: View {
             maxAbsDy = max(maxAbsDy, abs(dy))
         }
 
+        // Collect glow path (single blur pass for all segments)
+        var glowPath = Path()
+        for i in 0..<count {
+            let from = points[i]
+            let to = points[(i + 1) % count]
+            glowPath.move(to: from.position)
+            glowPath.addCurve(
+                to: to.position,
+                control1: from.controlOut ?? from.position,
+                control2: to.controlIn ?? to.position
+            )
+        }
+
+        var glowCtx = context
+        glowCtx.opacity = 0.06
+        glowCtx.addFilter(.blur(radius: 6))
+        glowCtx.stroke(glowPath, with: .color(.cyan), style: StrokeStyle(lineWidth: 12, lineCap: .round))
+
+        // Per-segment strokes (no blur)
         for i in 0..<count {
             let from = points[i]
             let to = points[(i + 1) % count]
@@ -64,16 +94,12 @@ struct ConductorView: View {
             let lineWidth = 1.5 + weight * 4.5
             let style = StrokeStyle(lineWidth: lineWidth, lineCap: .round)
 
-            var glowCtx = context
-            glowCtx.opacity = 0.03 + weight * 0.05
-            glowCtx.addFilter(.blur(radius: 3 + weight * 5))
-            glowCtx.stroke(seg, with: .color(.cyan), style: StrokeStyle(lineWidth: lineWidth * 3, lineCap: .round))
-
             context.stroke(seg, with: .color(.cyan.opacity(0.15 + weight * 0.25)), style: style)
         }
     }
 
     private func drawBeatPoints(context: GraphicsContext, points: [ConductorPathProvider.BeatPoint]) {
+        let beatCount = points.compactMap(\.beatIndex).count
         for point in points {
             guard let beat = point.beatIndex else { continue }
             let pt = point.position
@@ -88,7 +114,6 @@ struct ConductorView: View {
                 ringCtx.stroke(Circle().path(in: ringRect), with: .color(.cyan), lineWidth: 2)
             }
 
-            let beatCount = points.compactMap(\.beatIndex).count
             let scale: CGFloat = isDownbeat ? 1.0 : CGFloat(beatCount - beat) / CGFloat(beatCount)
             let dotSize: CGFloat = isActive ? 10 : (4 + 4 * scale)
             let color: Color = isActive ? .white : .cyan.opacity(0.2 + 0.4 * scale)

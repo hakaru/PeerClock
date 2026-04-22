@@ -66,10 +66,14 @@ actor PeerMetronomeService {
         peerClock = pc
         timebase = PeerClockTimebase(clock: pc)
 
-        updateDebug("Starting... ID: \(pc.localPeerID.description.prefix(8))")
+        updateDebug("Starting…")
         do {
             try await pc.start()
+            #if DEBUG
             updateDebug("Running. ID: \(pc.localPeerID.description.prefix(8))")
+            #else
+            updateDebug("Running")
+            #endif
         } catch {
             updateDebug("Error: \(error.localizedDescription)")
         }
@@ -154,6 +158,17 @@ actor PeerMetronomeService {
             let applyAtNs = command.payload.withUnsafeBytes {
                 UInt64(bigEndian: $0.load(as: UInt64.self))
             }
+            // Reject timestamps outside ±60 seconds of current synced time
+            if let pc = peerClock {
+                let nowNs = pc.now
+                let windowNs: UInt64 = 60_000_000_000
+                let lo = nowNs > windowNs ? nowNs - windowNs : 0
+                let hi = nowNs &+ windowNs
+                guard applyAtNs >= lo && applyAtNs <= hi else {
+                    logger.warning("metronome.config: applyAtNs out of range, ignoring")
+                    return
+                }
+            }
             let configData = command.payload.dropFirst(8)
             if let config = try? JSONDecoder().decode(MetronomeConfig.self, from: Data(configData)) {
                 configContinuation.yield((config, applyAtNs))
@@ -165,6 +180,17 @@ actor PeerMetronomeService {
 
         case "metronome.beat":
             if let event = try? JSONDecoder().decode(BeatEvent.self, from: command.payload) {
+                // Reject timestamps outside ±60 seconds of current synced time
+                if let pc = peerClock {
+                    let nowNs = pc.now
+                    let windowNs: UInt64 = 60_000_000_000
+                    let lo = nowNs > windowNs ? nowNs - windowNs : 0
+                    let hi = nowNs &+ windowNs
+                    guard event.applyAtNs >= lo && event.applyAtNs <= hi else {
+                        logger.warning("metronome.beat: applyAtNs out of range, ignoring")
+                        return
+                    }
+                }
                 beatContinuation.yield(event)
             }
 
