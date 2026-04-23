@@ -5,6 +5,45 @@ All notable changes to PeerClock are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] — Unreleased
+
+**`.auto` topology transitions now actually transition.** Closes the v0.4.0 gap
+where `.auto(peerCountThreshold:)` could detect the threshold crossing in
+tests but not in production, and where the transition was logical-only —
+downstream services (NTPSync / CommandRouter / Heartbeat / Status / Drift)
+continued pointing to the mesh transport even after a "transition."
+
+### Added (internal)
+
+- `PeerStreamFanOut` — thread-safe 1:N broadcaster for `AsyncStream` delivery.
+- `TopologyTransition` + `TopologyRuntime.transitionEvents` — event surface so
+  auto-topology can notify `PeerClock` of a ready transition.
+- `PeerClock.testHook_injectAutoPeers` / `testHook_currentTransportKind` /
+  `testHook_restartCount` / `testHook_forceMeshToStarTransition` (all DEBUG).
+
+### Changed
+
+- `MeshRuntime.subscribePeers()` and `MeshRuntime.peerStream` now yield real
+  `[Peer]` values derived from `transport.peers` (previously placeholder).
+  `MeshRuntime.currentPeerCount` returns the real count.
+- `PeerClock.runCoordinationLoop` consumes `runtime.peerStream` instead of
+  `transport.peers` directly. Observable behavior unchanged for mesh; the
+  refactor enables multiple subscribers (coord loop + AutoRuntime observer).
+- `AutoRuntime` no longer self-swaps its inner runtime. It emits a
+  `TopologyTransition(kind: .meshToStar)` on its new `transitionEvents`
+  stream; `PeerClock` orchestrates by calling `AutoRuntime.performTransition()`
+  and then rebuilds services via `restartServices(transport:)`.
+- `PeerClock.start()` and `stop()` are rewritten in terms of private
+  `restartServices(transport:)` + `teardownServices()` helpers; behavior
+  preserved.
+
+### Fixed
+
+- `AutoRuntime.testHook_injectDiscoveredPeers` no longer races with the real
+  peer-observer task (which was immediately overwriting the injected count
+  with `0` from empty `transport.peers` yields in unit-test environments).
+  The DEBUG hook now cancels the real observer on first call.
+
 ## [0.4.0] — Unreleased
 
 **Dual topology.** `PeerClock` now supports `.mesh` (v0.2.x-compatible), `.star` (new WebSocket-based, host-elected), and `.auto` (starts mesh, switches to star at peer count threshold). The v0.3.0-beta.1 star work is now exposed through the unified facade rather than requiring manual transport factory wiring.
