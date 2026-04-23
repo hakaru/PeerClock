@@ -18,4 +18,9 @@ struct TopologyFacadeTests {
             Issue.record("expected .star(role: .clientOnly)"); return
         }
     }
+
+    @Test("version is 0.4.0")
+    func versionIs040() {
+        #expect(PeerClock.version == "0.4.0")
+    }
 }
