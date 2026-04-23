@@ -4,19 +4,15 @@ import os.signpost
 private let topologySignposter = OSSignposter(subsystem: "net.hakaru.PeerClock", category: "Topology")
 
 /// Auto-topology runtime. Starts as `MeshRuntime`; when the peer-count
-/// heuristic fires (and remains above threshold for `settleWindow`), stops
-/// the inner mesh runtime and starts a `StarRuntime`. No reverse transition.
+/// heuristic fires (and remains above threshold for `settleWindow`), emits a
+/// `TopologyTransition(.meshToStar)` on `transitionEvents`. The physical swap
+/// is no longer performed inline — `PeerClock` observes the event, drains
+/// downstream services, then calls back into `performTransition()` to execute
+/// the swap. No reverse transition.
 ///
-/// Scope limitation (as of v0.4.0):
-/// - Real peer-count observation is not wired: `MeshRuntime.peerStream` is a
-///   placeholder pending a `transport.peers` fan-out refactor. The transition
-///   is driven in tests by `testHook_injectDiscoveredPeers(_:)` for now.
-/// - Transport hot-swap is logical only: `PeerClock.start()` snapshots the
-///   initial transport, so downstream services continue to address the mesh
-///   transport after transition. Full physical swap requires coordinated
-///   restart of NTPSync/CommandRouter/heartbeat/status at the facade.
-///
-/// See the tech-debt task "real mesh peer-count observation + hot-swap".
+/// Real peer-count observation is now wired through `MeshRuntime.subscribePeers()`
+/// (Phase 1 fan-out). Tests may still inject counts synthetically via
+/// `testHook_injectDiscoveredPeers(_:)`.
 internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
     enum Mode: Sendable, Equatable { case mesh, star }
 
@@ -34,14 +30,15 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
     private var active: (any TopologyRuntime)?
     private var _mode: Mode = .mesh
     private var settleTask: Task<Void, Never>?
+    /// Observes the inner `MeshRuntime.subscribePeers()` stream to drive
+    /// `onPeerCount`. Torn down on transition / stop.
+    private var peerObserverTask: Task<Void, Never>?
     /// Forwards `active.connectionEvents` into our own continuation. Re-spawned
-    /// on `transitionToStar()` so events from the new inner runtime surface.
+    /// on `performTransition()` so events from the new inner runtime surface.
     private var connectionEventForwardTask: Task<Void, Never>?
     private var peerContinuation: AsyncStream<[Peer]>.Continuation
     private var commandContinuation: AsyncStream<(PeerID, Command)>.Continuation
     private var connectionEventsContinuation: AsyncStream<ConnectionEvent>.Continuation
-    /// Will be used in Task 2.2 to emit `TopologyTransition.meshToStar` when
-    /// the settle window completes. Never yields in this task.
     internal var transitionEventsContinuation: AsyncStream<TopologyTransition>.Continuation
 
     init(
@@ -67,8 +64,6 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
         self.connectionEvents = AsyncStream { ec = $0 }
         self.connectionEventsContinuation = ec
 
-        // Never-yielding for now; Task 2.2 will wire this up to emit
-        // `TopologyTransition.meshToStar` when the settle window completes.
         var te: AsyncStream<TopologyTransition>.Continuation!
         self.transitionEvents = AsyncStream { te = $0 }
         self.transitionEventsContinuation = te
@@ -85,9 +80,30 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
 
     func start() async throws {
         let mesh = MeshRuntime(transport: WiFiTransport(localPeerID: localPeerID, configuration: configuration))
-        lock.withLock { self.active = mesh }
         try await mesh.start()
+        lock.withLock {
+            self.active = mesh
+            self._mode = .mesh
+        }
+        startPeerObserver(from: mesh)
         spawnConnectionEventForwarder(from: mesh)
+    }
+
+    /// Subscribe to the inner `MeshRuntime.subscribePeers()` stream and
+    /// funnel each peer-set snapshot into `onPeerCountObserved(_:)`.
+    private func startPeerObserver(from mesh: MeshRuntime) {
+        let stream = mesh.subscribePeers()
+        let task = Task { [weak self] in
+            for await peers in stream {
+                if Task.isCancelled { break }
+                await self?.onPeerCountObserved(peers.count)
+            }
+        }
+        lock.withLock { self.peerObserverTask = task }
+    }
+
+    private func onPeerCountObserved(_ count: Int) async {
+        onPeerCount(count)
     }
 
     /// (Re-)subscribe to the active inner runtime's `connectionEvents` stream.
@@ -108,12 +124,14 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
     }
 
     func stop() async {
-        let (current, settle, forward) = lock.withLock { () -> ((any TopologyRuntime)?, Task<Void, Never>?, Task<Void, Never>?) in
+        let (current, settle, forward, peerObs) = lock.withLock { () -> ((any TopologyRuntime)?, Task<Void, Never>?, Task<Void, Never>?, Task<Void, Never>?) in
             let s = settleTask; settleTask = nil
             let a = active; active = nil
             let f = connectionEventForwardTask; connectionEventForwardTask = nil
-            return (a, s, f)
+            let po = peerObserverTask; peerObserverTask = nil
+            return (a, s, f, po)
         }
+        peerObs?.cancel()
         settle?.cancel()
         forward?.cancel()
         await current?.stop()
@@ -135,9 +153,9 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
     var mode: Mode { lock.withLock { _mode } }
 
     /// Drive a peer-count observation and (conditionally) begin the settle
-    /// window towards transition. Normally invoked by an internal observer
-    /// watching `mesh.peerStream`; today that stream is a placeholder, so
-    /// the primary caller is the test hook.
+    /// window. On timeout the settle task emits a `TopologyTransition` event
+    /// rather than performing the swap — the caller (`PeerClock`) is
+    /// responsible for invoking `performTransition()`.
     private func onPeerCount(_ count: Int) {
         lock.withLock {
             guard case .peerCountThreshold(let n) = heuristic else { return }
@@ -147,7 +165,7 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
                 settleTask = Task { [weak self] in
                     try? await Task.sleep(for: self?.settleWindow ?? .seconds(3))
                     if Task.isCancelled { return }
-                    await self?.transitionToStar()
+                    await self?.announceTransitionReady()
                 }
             } else {
                 settleTask?.cancel()
@@ -156,36 +174,45 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
         }
     }
 
-    private func transitionToStar() async {
+    /// Emit a `TopologyTransition(.meshToStar)` event iff we're still in
+    /// `.mesh`. Does not mutate `_mode` or touch the inner runtime.
+    private func announceTransitionReady() async {
+        let readyToEmit = lock.withLock { _mode == .mesh }
+        guard readyToEmit else { return }
+        transitionEventsContinuation.yield(TopologyTransition(kind: .meshToStar))
+    }
+
+    /// Perform the physical mesh → star swap. Called explicitly by
+    /// `PeerClock` after it has drained downstream services. Idempotent:
+    /// a no-op if already in `.star`.
+    internal func performTransition() async throws {
+        let old: (any TopologyRuntime)? = lock.withLock {
+            guard _mode == .mesh else { return nil }
+            return active
+        }
+        guard let old else { return }
+
         let signpostID = topologySignposter.makeSignpostID()
         let interval = topologySignposter.beginInterval("mesh→star", id: signpostID)
         defer { topologySignposter.endInterval("mesh→star", interval) }
 
-        let shouldTransition: Bool = lock.withLock {
-            _mode == .mesh
+        // Tear down the mesh peer observer and the mesh runtime itself.
+        let priorPeerObs = lock.withLock { () -> Task<Void, Never>? in
+            let p = peerObserverTask; peerObserverTask = nil
+            return p
         }
-        guard shouldTransition else { return }
-
-        let old: (any TopologyRuntime)? = lock.withLock {
-            let o = active
-            return o
-        }
-        await old?.stop()
+        priorPeerObs?.cancel()
+        await old.stop()
 
         let star = StarRuntime(localPeerID: localPeerID, role: .auto, configuration: configuration)
-        do {
-            try await star.start()
-            lock.withLock {
-                self.active = star
-                self._mode = .star
-                self.settleTask = nil
-            }
-            // Re-subscribe observability forwarder to the new inner runtime.
-            spawnConnectionEventForwarder(from: star)
-        } catch {
-            // Rollback: best effort — recreate mesh. In practice this is rare;
-            // logging the failure is enough for the skeleton.
+        try await star.start()
+        lock.withLock {
+            self.active = star
+            self._mode = .star
+            self.settleTask = nil
         }
+        // Re-subscribe the connectionEvents forwarder to the new runtime.
+        spawnConnectionEventForwarder(from: star)
     }
 
     #if DEBUG
@@ -193,8 +220,8 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
     internal var testHook_currentMode: Mode { mode }
 
     /// Test-only: simulate `count` discovered peers to exercise the heuristic.
-    /// Does not exercise the inner MeshRuntime's actual peer stream — it
-    /// drives the decision logic directly.
+    /// Drives the decision logic directly — same entry point as the real
+    /// `mesh.subscribePeers()` observer.
     internal func testHook_injectDiscoveredPeers(count: Int) {
         onPeerCount(count)
     }
