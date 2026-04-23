@@ -29,6 +29,7 @@ public actor HostElection {
     private let advertiser: BonjourAdvertiser
     private let termStore: TermStore
     private let fencing: HostFencing
+    private let serviceType: String
 
     /// Configurable timing
     public struct Timing: Sendable {
@@ -62,7 +63,8 @@ public actor HostElection {
         browser: BonjourBrowser,
         advertiser: BonjourAdvertiser,
         termStore: TermStore,
-        timing: Timing = Timing()
+        timing: Timing = Timing(),
+        serviceType: String = PeerClockService.type
     ) {
         self.localPeerID = localPeerID
         self.transport = transport
@@ -71,6 +73,7 @@ public actor HostElection {
         self.termStore = termStore
         self.fencing = HostFencing(termStore: termStore)
         self.timing = timing
+        self.serviceType = serviceType
 
         var cont: AsyncStream<ElectionState>.Continuation!
         self.stateStream = AsyncStream { cont = $0 }
@@ -92,7 +95,7 @@ public actor HostElection {
         await transitionTo(.discovering)
 
         // Start Bonjour browsing (critical: without this, peer discovery never runs)
-        browser.start()
+        browser.start(serviceType: serviceType)
 
         // Subscribe to BonjourBrowser
         observerTask = Task { [weak self] in

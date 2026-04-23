@@ -17,14 +17,7 @@ struct BonjourServiceTypeTests {
 
     @Test("star Bonjour service type is _peerclockstar._tcp (distinct from mesh)")
     func starServiceTypeDistinct() {
-        // StarRuntime's `serviceType` is file-private; assertion is indirect here.
-        // Mesh uses `_peerclock._udp`; the star advertiser is wired to
-        // `_peerclockstar._tcp` in StarRuntime.swift. When HostElection gains a
-        // configurable service type (tracked as a follow-up), this test can
-        // grow a direct assertion via a test hook. For now it locks the mesh
-        // value above (the real compat requirement) and documents the star
-        // intent here.
-        let meshType = Configuration.default.serviceType
-        #expect(!meshType.contains("peerclockstar"), "mesh must not reuse the star service type")
+        #expect(StarRuntime.serviceType == "_peerclockstar._tcp")
+        #expect(StarRuntime.serviceType != Configuration.default.serviceType)
     }
 }

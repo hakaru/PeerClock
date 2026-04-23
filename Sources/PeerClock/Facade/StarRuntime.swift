@@ -17,11 +17,10 @@ internal final class StarRuntime: TopologyRuntime, @unchecked Sendable {
     /// never interconnect. Kept private to this file — no public API added
     /// by Task 2.4 (see v0.4.0 dual-topology plan).
     ///
-    /// Note: `HostElection.start()` calls `browser.start()` with its default
-    /// service type argument (`PeerClockService.type`). When the `.auto` role
-    /// path runs election, that default takes precedence over the value below.
-    /// Unifying service types is tracked by the fan-out refactor follow-up.
-    private static let serviceType = "_peerclockstar._tcp"
+    /// `HostElection.init(... serviceType:)` accepts this value; the `.auto`
+    /// path now passes it through so election-driven peer discovery also
+    /// advertises/browses on `_peerclockstar._tcp`.
+    internal static let serviceType = "_peerclockstar._tcp"
 
     let transport: any Transport
     let peerStream: AsyncStream<[Peer]>
@@ -90,7 +89,8 @@ internal final class StarRuntime: TopologyRuntime, @unchecked Sendable {
                 transport: star,
                 browser: browser,
                 advertiser: advertiser,
-                termStore: termStore
+                termStore: termStore,
+                serviceType: Self.serviceType
             )
             self.election = election
             await election.start()
