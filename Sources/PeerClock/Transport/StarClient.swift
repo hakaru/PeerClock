@@ -43,7 +43,16 @@ public final class StarClient: @unchecked Sendable {
     // Task 13: Suppress reconnect when user explicitly closed — protected by `lock`
     private var userClosed = false
 
-    public init() {
+    /// Optional observer for high-level connection events
+    /// (handshake failures, deadlines). Wired from `StarTransport`.
+    /// Kept as a plain stored property — called on `connectionQueue` /
+    /// send-completion callbacks. The closure itself is `@Sendable` so
+    /// hopping to another actor is fine if the consumer wants.
+    private var onConnectionEvent: (@Sendable (ConnectionEvent) -> Void)?
+
+    public init(onConnectionEvent: (@Sendable (ConnectionEvent) -> Void)? = nil) {
+        self.onConnectionEvent = onConnectionEvent
+
         var ic: AsyncStream<Data>.Continuation!
         self.incomingMessages = AsyncStream { ic = $0 }
         self.incomingContinuation = ic
@@ -153,6 +162,7 @@ public final class StarClient: @unchecked Sendable {
             guard let self, let connection else { return }
             if case .handshaking = self.lock.withLock({ self.currentState }) {
                 logger.error("[StarClient] handshake timeout (5s)")
+                self.onConnectionEvent?(ConnectionEvent(reason: .timeout))
                 connection.cancel()
             }
         }
@@ -201,6 +211,7 @@ public final class StarClient: @unchecked Sendable {
                     if headers.contains("101 Switching Protocols") {
                         let accept = WebSocketHandshake.extractAccept(from: headers)
                         guard accept == self?.expectedAccept else {
+                            self?.onConnectionEvent?(ConnectionEvent(reason: .handshakeFailed(.badAcceptHash)))
                             self?.updateState(.closed("handshake accept mismatch: expected \(self?.expectedAccept ?? "nil"), got \(accept ?? "nil")"))
                             return
                         }
@@ -208,6 +219,7 @@ public final class StarClient: @unchecked Sendable {
                         let leftover = buffer[end.upperBound...]
                         self?.startFrameLoop(connection: connection, initial: Data(leftover))
                     } else {
+                        self?.onConnectionEvent?(ConnectionEvent(reason: .handshakeFailed(.invalidUpgrade)))
                         self?.updateState(.closed("handshake rejected: \(headers)"))
                     }
                 } else {
@@ -228,6 +240,7 @@ public final class StarClient: @unchecked Sendable {
             let maxBufferSize = 2 * 1_048_576
             if buffer.count > maxBufferSize {
                 logger.error("[StarClient] buffer overflow (\(buffer.count) bytes) — closing connection")
+                self.onConnectionEvent?(ConnectionEvent(reason: .handshakeFailed(.oversizedFrame)))
                 connection.cancel()
                 return
             }

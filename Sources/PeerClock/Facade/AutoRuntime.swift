@@ -22,6 +22,7 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
 
     let peerStream: AsyncStream<[Peer]>
     let commandStream: AsyncStream<(PeerID, Command)>
+    let connectionEvents: AsyncStream<ConnectionEvent>
 
     private let localPeerID: PeerID
     private let heuristic: AutoHeuristic
@@ -32,8 +33,12 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
     private var active: (any TopologyRuntime)?
     private var _mode: Mode = .mesh
     private var settleTask: Task<Void, Never>?
+    /// Forwards `active.connectionEvents` into our own continuation. Re-spawned
+    /// on `transitionToStar()` so events from the new inner runtime surface.
+    private var connectionEventForwardTask: Task<Void, Never>?
     private var peerContinuation: AsyncStream<[Peer]>.Continuation
     private var commandContinuation: AsyncStream<(PeerID, Command)>.Continuation
+    private var connectionEventsContinuation: AsyncStream<ConnectionEvent>.Continuation
 
     init(
         localPeerID: PeerID,
@@ -53,6 +58,10 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
         var cc: AsyncStream<(PeerID, Command)>.Continuation!
         self.commandStream = AsyncStream { cc = $0 }
         self.commandContinuation = cc
+
+        var ec: AsyncStream<ConnectionEvent>.Continuation!
+        self.connectionEvents = AsyncStream { ec = $0 }
+        self.connectionEventsContinuation = ec
     }
 
     var transport: any Transport {
@@ -68,18 +77,39 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
         let mesh = MeshRuntime(transport: WiFiTransport(localPeerID: localPeerID, configuration: configuration))
         lock.withLock { self.active = mesh }
         try await mesh.start()
+        spawnConnectionEventForwarder(from: mesh)
+    }
+
+    /// (Re-)subscribe to the active inner runtime's `connectionEvents` stream.
+    /// Cancels any prior forwarder and spawns a new one.
+    private func spawnConnectionEventForwarder(from runtime: any TopologyRuntime) {
+        let prior = lock.withLock { () -> Task<Void, Never>? in
+            let p = connectionEventForwardTask
+            return p
+        }
+        prior?.cancel()
+        let cont = connectionEventsContinuation
+        let task = Task {
+            for await event in runtime.connectionEvents {
+                cont.yield(event)
+            }
+        }
+        lock.withLock { self.connectionEventForwardTask = task }
     }
 
     func stop() async {
-        let (current, task) = lock.withLock { () -> ((any TopologyRuntime)?, Task<Void, Never>?) in
+        let (current, settle, forward) = lock.withLock { () -> ((any TopologyRuntime)?, Task<Void, Never>?, Task<Void, Never>?) in
             let s = settleTask; settleTask = nil
             let a = active; active = nil
-            return (a, s)
+            let f = connectionEventForwardTask; connectionEventForwardTask = nil
+            return (a, s, f)
         }
-        task?.cancel()
+        settle?.cancel()
+        forward?.cancel()
         await current?.stop()
         peerContinuation.finish()
         commandContinuation.finish()
+        connectionEventsContinuation.finish()
     }
 
     var currentPeerCount: Int {
@@ -139,6 +169,8 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
                 self._mode = .star
                 self.settleTask = nil
             }
+            // Re-subscribe observability forwarder to the new inner runtime.
+            spawnConnectionEventForwarder(from: star)
         } catch {
             // Rollback: best effort — recreate mesh. In practice this is rare;
             // logging the failure is enough for the skeleton.

@@ -25,6 +25,7 @@ internal final class StarRuntime: TopologyRuntime, @unchecked Sendable {
     let transport: any Transport
     let peerStream: AsyncStream<[Peer]>
     let commandStream: AsyncStream<(PeerID, Command)>
+    let connectionEvents: AsyncStream<ConnectionEvent>
 
     private let localPeerID: PeerID
     private let role: StarRole
@@ -36,6 +37,8 @@ internal final class StarRuntime: TopologyRuntime, @unchecked Sendable {
 
     private let peerContinuation: AsyncStream<[Peer]>.Continuation
     private let commandContinuation: AsyncStream<(PeerID, Command)>.Continuation
+    private let connectionEventsContinuation: AsyncStream<ConnectionEvent>.Continuation
+    private var connectionEventForwardTask: Task<Void, Never>?
 
     init(localPeerID: PeerID, role: StarRole, configuration: Configuration) {
         self.localPeerID = localPeerID
@@ -66,6 +69,10 @@ internal final class StarRuntime: TopologyRuntime, @unchecked Sendable {
         var cc: AsyncStream<(PeerID, Command)>.Continuation!
         self.commandStream = AsyncStream { cc = $0 }
         self.commandContinuation = cc
+
+        var ec: AsyncStream<ConnectionEvent>.Continuation!
+        self.connectionEvents = AsyncStream { ec = $0 }
+        self.connectionEventsContinuation = ec
     }
 
     func start() async throws {
@@ -103,6 +110,17 @@ internal final class StarRuntime: TopologyRuntime, @unchecked Sendable {
         // drive its lifecycle); still call it for symmetry with the Transport
         // protocol contract.
         try await transport.start()
+
+        // Forward the transport's observability events into our own stream so
+        // `PeerClock` can subscribe via `TopologyRuntime.connectionEvents`.
+        if let star = transport as? StarTransport {
+            let cont = connectionEventsContinuation
+            connectionEventForwardTask = Task {
+                for await event in star.connectionEvents {
+                    cont.yield(event)
+                }
+            }
+        }
     }
 
     func stop() async {
@@ -118,8 +136,11 @@ internal final class StarRuntime: TopologyRuntime, @unchecked Sendable {
             browser.stop()
         }
         election = nil
+        connectionEventForwardTask?.cancel()
+        connectionEventForwardTask = nil
         peerContinuation.finish()
         commandContinuation.finish()
+        connectionEventsContinuation.finish()
     }
 
     /// Placeholder — always `0` in Phase 2. See type-level doc comment.

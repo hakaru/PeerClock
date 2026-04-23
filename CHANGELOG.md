@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `AutoHeuristic.peerCountThreshold(N)` (default N=5)
 - Star Bonjour service type `_peerclockstar._tcp` (separate from `_peerclock._tcp` to prevent mesh/star cross-discovery)
 - `WireCompatGoldenTests` — byte-identity tests for mesh `MessageCodec` output vs v0.2.x fixtures
-- `ConnectionEvent` observability type + `PeerClock.connectionEvents: AsyncStream<ConnectionEvent>` for surfacing star handshake failures, timeouts, rejections, and disconnects (producers in StarClient/StarHost/StarTransport wire in a follow-up).
+- `ConnectionEvent` observability type + `PeerClock.connectionEvents: AsyncStream<ConnectionEvent>` surfacing star handshake failures (`invalidUpgrade` / `badAcceptHash` / `oversizedFrame`), timeouts, and disconnects. Producers wired in StarClient / StarHost / StarTransport; mesh topology emits nothing.
 
 ### Changed
 

@@ -34,13 +34,11 @@ public final class PeerClock: @unchecked Sendable {
     public let peers: AsyncStream<[Peer]>
 
     /// Stream of observability events about connection lifecycle (star
-    /// handshake failures, timeouts, rejections, disconnects). Consumers
-    /// use this for analytics or UI. Events originate from the star
-    /// transport's failure paths.
+    /// handshake failures, timeouts, disconnects). Consumers use this for
+    /// analytics or UI. Events originate from the star transport's
+    /// failure paths (``StarClient`` / ``StarHost`` / ``StarTransport``).
     ///
-    /// Emits only in star/auto topologies. Empty in pure mesh. As of v0.4.0
-    /// real producers in ``StarClient`` / ``StarHost`` / ``StarTransport`` are
-    /// not yet wired — tracked as follow-up tech debt.
+    /// Emits only in star/auto topologies. Empty in pure mesh.
     public let connectionEvents: AsyncStream<ConnectionEvent>
 
     /// Stream of incoming application commands from remote peers.
@@ -148,6 +146,7 @@ public final class PeerClock: @unchecked Sendable {
     private var statusPushRoutingTask: Task<Void, Never>?
     private var heartbeatElectionTask: Task<Void, Never>?
     private var driftJumpRoutingTask: Task<Void, Never>?
+    private var connectionEventsForwardTask: Task<Void, Never>?
 
     // MARK: - Private: Stream Continuations
 
@@ -241,6 +240,16 @@ public final class PeerClock: @unchecked Sendable {
 
         lock.withLock { self.runtime = rt }
         try await rt.start()
+
+        // Forward the topology runtime's observability events into the
+        // public `connectionEvents` stream. Runs until `stop()` cancels it.
+        let connEventsCont = self.connectionEventsContinuation
+        let eventsForwardTask = Task {
+            for await event in rt.connectionEvents {
+                connEventsCont.yield(event)
+            }
+        }
+        lock.withLock { self.connectionEventsForwardTask = eventsForwardTask }
 
         let tr: any Transport = lock.withLock {
             let newTransport = rt.transport
@@ -407,7 +416,7 @@ public final class PeerClock: @unchecked Sendable {
 
     /// Stops synchronization and disconnects from all peers.
     public func stop() async {
-        let (coordTask, syncResponder, fwdTask, hbTask, spTask, hbElecTask, djTask, eng, rt, registry, receiver, heartbeat, sched) = lock.withLock {
+        let (coordTask, syncResponder, fwdTask, hbTask, spTask, hbElecTask, djTask, ceTask, eng, rt, registry, receiver, heartbeat, sched) = lock.withLock {
             let c = coordinationTask; coordinationTask = nil
             let s = syncResponderTask; syncResponderTask = nil
             let f = syncStateForwardTask; syncStateForwardTask = nil
@@ -415,13 +424,14 @@ public final class PeerClock: @unchecked Sendable {
             let sp = statusPushRoutingTask; statusPushRoutingTask = nil
             let he = heartbeatElectionTask; heartbeatElectionTask = nil
             let dj = driftJumpRoutingTask; driftJumpRoutingTask = nil
+            let ce = connectionEventsForwardTask; connectionEventsForwardTask = nil
             let e = syncEngine
             let r = runtime
             let reg = statusRegistry; statusRegistry = nil
             let rec = statusReceiver; statusReceiver = nil
             let hb = heartbeatMonitor; heartbeatMonitor = nil
             let sc = eventScheduler; eventScheduler = nil
-            return (c, s, f, h, sp, he, dj, e, r, reg, rec, hb, sc)
+            return (c, s, f, h, sp, he, dj, ce, e, r, reg, rec, hb, sc)
         }
 
         // Cancel routing/coord tasks synchronously.
@@ -432,6 +442,7 @@ public final class PeerClock: @unchecked Sendable {
         spTask?.cancel()
         hbElecTask?.cancel()
         djTask?.cancel()
+        ceTask?.cancel()
 
         // Await task termination AND component/transport shutdown concurrently,
         // so a hang in any single shutdown path does not hold transport
@@ -444,6 +455,7 @@ public final class PeerClock: @unchecked Sendable {
         async let spAwait: Void? = spTask?.value
         async let hbElecAwait: Void? = hbElecTask?.value
         async let djAwait: Void? = djTask?.value
+        async let ceAwait: Void? = ceTask?.value
         async let engShutdown: Void? = eng?.stop()
         async let registryShutdown: Void? = registry?.shutdown()
         async let receiverShutdown: Void? = receiver?.shutdown()
@@ -452,7 +464,7 @@ public final class PeerClock: @unchecked Sendable {
         // Transport shutdown is delegated to the topology runtime.
         async let rtShutdown: Void? = rt?.stop()
 
-        _ = await (coordAwait, syncRespAwait, fwdAwait, hbAwait, spAwait, hbElecAwait, djAwait)
+        _ = await (coordAwait, syncRespAwait, fwdAwait, hbAwait, spAwait, hbElecAwait, djAwait, ceAwait)
         _ = await (engShutdown, registryShutdown, receiverShutdown, heartbeatShutdown, schedShutdown, rtShutdown)
 
         lock.withLock {

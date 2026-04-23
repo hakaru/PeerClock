@@ -13,6 +13,12 @@ internal protocol TopologyRuntime: AnyObject, Sendable {
     var peerStream: AsyncStream<[Peer]> { get }
     var commandStream: AsyncStream<(PeerID, Command)> { get }
 
+    /// Observability events originating from the transport stack
+    /// (star handshake failures, timeouts, disconnects). Mesh runtime
+    /// produces no events; star/auto runtimes forward from the inner
+    /// `StarTransport`.
+    var connectionEvents: AsyncStream<ConnectionEvent> { get }
+
     /// Used by `AutoRuntime` to observe peer count without exposing
     /// transport internals.
     var currentPeerCount: Int { get async }

@@ -18,9 +18,11 @@ internal final class MeshRuntime: TopologyRuntime, @unchecked Sendable {
     let transport: any Transport
     let peerStream: AsyncStream<[Peer]>
     let commandStream: AsyncStream<(PeerID, Command)>
+    let connectionEvents: AsyncStream<ConnectionEvent>
 
     private let peerContinuation: AsyncStream<[Peer]>.Continuation
     private let commandContinuation: AsyncStream<(PeerID, Command)>.Continuation
+    private let connectionEventsContinuation: AsyncStream<ConnectionEvent>.Continuation
 
     init(transport: any Transport) {
         self.transport = transport
@@ -32,6 +34,13 @@ internal final class MeshRuntime: TopologyRuntime, @unchecked Sendable {
         var cc: AsyncStream<(PeerID, Command)>.Continuation!
         self.commandStream = AsyncStream { cc = $0 }
         self.commandContinuation = cc
+
+        // Mesh topology has no handshake, so this stream never yields.
+        // It exists purely to satisfy the TopologyRuntime protocol
+        // (AutoRuntime / PeerClock treat it uniformly).
+        var ec: AsyncStream<ConnectionEvent>.Continuation!
+        self.connectionEvents = AsyncStream { ec = $0 }
+        self.connectionEventsContinuation = ec
     }
 
     func start() async throws {
@@ -42,6 +51,7 @@ internal final class MeshRuntime: TopologyRuntime, @unchecked Sendable {
         await transport.stop()
         peerContinuation.finish()
         commandContinuation.finish()
+        connectionEventsContinuation.finish()
     }
 
     /// Placeholder — always `0` in Phase 2. See type-level doc comment.

@@ -32,7 +32,14 @@ public final class StarHost: @unchecked Sendable {
     private var restartCount = 0
     private let maxRestarts = 3
 
-    public init() {
+    /// Optional observer for handshake / connection-lifecycle events.
+    /// Wired from `StarTransport`. Each `ClientSession` invokes
+    /// `host?.onConnectionEvent?(...)` on failure.
+    internal var onConnectionEvent: (@Sendable (ConnectionEvent) -> Void)?
+
+    public init(onConnectionEvent: (@Sendable (ConnectionEvent) -> Void)? = nil) {
+        self.onConnectionEvent = onConnectionEvent
+
         var cc: AsyncStream<[ClientConnection]>.Continuation!
         self.clients = AsyncStream { cc = $0 }
         self.clientsContinuation = cc
@@ -138,6 +145,11 @@ public final class StarHost: @unchecked Sendable {
     private func accept(_ connection: NWConnection) {
         let sessionID = UUID()
         let session = ClientSession(id: sessionID, connection: connection)
+        // Thread the event callback through so ClientSession can emit
+        // handshake failures / oversized-frame / invalidUpgrade events.
+        session.onConnectionEvent = { [weak self] event in
+            self?.onConnectionEvent?(event)
+        }
 
         session.onHandshakeComplete = { [weak self] in
             guard let self else { return }
@@ -146,12 +158,20 @@ public final class StarHost: @unchecked Sendable {
             session.startFrameLoop { [weak self] data in
                 self?.messagesContinuation.yield((clientID: sessionID, data: data))
             } onClose: { [weak self] in
+                // Emit disconnected for graceful / I/O-driven close. Uses the
+                // assigned PeerID if the client had completed identity handshake.
+                if let peer = session.assignedPeerID {
+                    self?.onConnectionEvent?(ConnectionEvent(reason: .disconnected(peer: peer), peer: peer))
+                }
                 self?.removeSession(sessionID)
             }
         }
 
         lock.withLock { sessions[sessionID] = session }
         session.startHandshake(onConnectionLost: { [weak self] in
+            if let peer = session.assignedPeerID {
+                self?.onConnectionEvent?(ConnectionEvent(reason: .disconnected(peer: peer), peer: peer))
+            }
             self?.removeSession(sessionID)
         })
     }
@@ -222,6 +242,9 @@ final class ClientSession: @unchecked Sendable {
     let id: UUID
     let connection: NWConnection
     var onHandshakeComplete: (() -> Void)?
+    /// Invoked on handshake failures / protocol violations to surface
+    /// observability events. Wired by `StarHost.accept(_:)`.
+    var onConnectionEvent: (@Sendable (ConnectionEvent) -> Void)?
 
     // Thread-safe assignedPeerID — reads from any context, written on sessionQueue
     private let stateLock = NSLock()
@@ -296,6 +319,7 @@ final class ClientSession: @unchecked Sendable {
         let deadline = DispatchWorkItem { [weak self] in
             guard let self else { return }
             logger.error("[ClientSession \(self.id)] handshake timeout (5s)")
+            self.onConnectionEvent?(ConnectionEvent(reason: .timeout))
             self.connection.cancel()
         }
         handshakeDeadline = deadline
@@ -335,6 +359,7 @@ final class ClientSession: @unchecked Sendable {
                     } else if self.buffer.count > 16_384 {
                         // N-1: cap buffer size to prevent memory exhaustion
                         logger.warning("[ClientSession \(self.id)] handshake buffer overflow")
+                        self.onConnectionEvent?(ConnectionEvent(reason: .handshakeFailed(.oversizedFrame)))
                         self.connection.cancel()
                         return
                     } else {
@@ -351,6 +376,7 @@ final class ClientSession: @unchecked Sendable {
 
     private func sendHandshakeResponse(request: String) {
         guard let key = WebSocketHandshake.extractKey(from: request) else {
+            onConnectionEvent?(ConnectionEvent(reason: .handshakeFailed(.invalidUpgrade)))
             sendHandshakeError(reason: "missing Sec-WebSocket-Key")
             return
         }
@@ -387,6 +413,7 @@ final class ClientSession: @unchecked Sendable {
             let maxBufferSize = 2 * 1_048_576
             if self.buffer.count > maxBufferSize {
                 logger.error("[ClientSession \(self.id)] buffer overflow (\(self.buffer.count) bytes) — closing connection")
+                self.onConnectionEvent?(ConnectionEvent(reason: .handshakeFailed(.oversizedFrame)))
                 self.onConnectionLost = nil
                 self.connection.stateUpdateHandler = nil
                 self.connection.cancel()

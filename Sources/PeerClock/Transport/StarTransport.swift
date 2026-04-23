@@ -19,8 +19,13 @@ public final class StarTransport: Transport, @unchecked Sendable {
     public let peers: AsyncStream<Set<PeerID>>
     public let incomingMessages: AsyncStream<(PeerID, Data)>
 
+    /// Observability stream of star-handshake / connection failures. Populated
+    /// by `StarClient` and `StarHost` via `reportConnectionEvent(_:)`.
+    public let connectionEvents: AsyncStream<ConnectionEvent>
+
     private let peersContinuation: AsyncStream<Set<PeerID>>.Continuation
     private let incomingContinuation: AsyncStream<(PeerID, Data)>.Continuation
+    private let connectionEventsContinuation: AsyncStream<ConnectionEvent>.Continuation
 
     // MARK: - Role
 
@@ -64,6 +69,17 @@ public final class StarTransport: Transport, @unchecked Sendable {
         var ic: AsyncStream<(PeerID, Data)>.Continuation!
         self.incomingMessages = AsyncStream { ic = $0 }
         self.incomingContinuation = ic
+
+        var ec: AsyncStream<ConnectionEvent>.Continuation!
+        self.connectionEvents = AsyncStream { ec = $0 }
+        self.connectionEventsContinuation = ec
+    }
+
+    /// Publishes a connection event onto `connectionEvents`. Called by
+    /// `StarClient` / `StarHost` through closures threaded from this
+    /// transport on role transition.
+    internal func reportConnectionEvent(_ event: ConnectionEvent) {
+        connectionEventsContinuation.yield(event)
     }
 
     // MARK: - Transport protocol
@@ -154,7 +170,9 @@ public final class StarTransport: Transport, @unchecked Sendable {
         oldClient?.destroy()
 
         // Now promote
-        let h = StarHost()
+        let h = StarHost(onConnectionEvent: { [weak self] event in
+            self?.reportConnectionEvent(event)
+        })
         let listener = try h.start()
         let forwardTask = Task<Void, Never> { [weak self] in
             await self?.forwardHostEvents(from: h)
@@ -189,7 +207,9 @@ public final class StarTransport: Transport, @unchecked Sendable {
         oldClient?.destroy()
 
         // Now demote
-        let c = StarClient()
+        let c = StarClient(onConnectionEvent: { [weak self] event in
+            self?.reportConnectionEvent(event)
+        })
         c.connect(to: endpoint)
         let forwardTask = Task<Void, Never> { [weak self] in
             await self?.forwardClientEvents(from: c, hostPeerID: hostPeerID)
@@ -234,12 +254,22 @@ public final class StarTransport: Transport, @unchecked Sendable {
     private func forwardClientEvents(from c: StarClient, hostPeerID: PeerID) async {
         await withTaskGroup(of: Void.self) { group in
             group.addTask { [weak self] in
-                // Forward state changes → peers stream
+                // Forward state changes → peers stream.
+                // Also surface `.disconnected(peer:)` observability events
+                // when the client connection closes after having been ready.
+                var wasReady = false
                 for await state in c.stateStream {
                     switch state {
                     case .ready:
+                        wasReady = true
                         self?.peersContinuation.yield([hostPeerID])
                     case .closed:
+                        if wasReady {
+                            self?.reportConnectionEvent(
+                                ConnectionEvent(reason: .disconnected(peer: hostPeerID), peer: hostPeerID)
+                            )
+                        }
+                        wasReady = false
                         self?.peersContinuation.yield([])
                     default:
                         break

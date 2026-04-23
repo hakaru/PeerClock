@@ -5,9 +5,9 @@ import Foundation
 /// analytics or surface them in UI (e.g. "DAWSync handshake failed —
 /// invalidUpgrade").
 ///
-/// As of v0.4.0 the stream is wired but producers in star-transport failure
-/// paths are not yet emitting events; see the tech-debt task to wire real
-/// producers in `StarClient` / `StarHost` / `StarTransport`.
+/// Producers live in ``StarClient``, ``StarHost``, and ``StarTransport``;
+/// events flow up through the topology runtime into the facade. Mesh
+/// topology emits nothing on this stream.
 public struct ConnectionEvent: Sendable, Equatable {
 
     public enum HandshakeFailure: Sendable, Equatable {
