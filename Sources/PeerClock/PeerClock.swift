@@ -952,5 +952,19 @@ public final class PeerClock: @unchecked Sendable {
     public func testHook_forceMeshToStarTransition() async {
         await performMeshToStarTransition()
     }
+
+    /// Test-only: inject a fake peer count through the active `AutoRuntime`'s
+    /// settle path. Requires `.auto` topology and that `start()` has been called.
+    /// No-op if the active runtime isn't `AutoRuntime`.
+    public func testHook_injectAutoPeers(count: Int) {
+        guard let auto = lock.withLock({ runtime as? AutoRuntime }) else { return }
+        auto.testHook_injectDiscoveredPeers(count: count)
+    }
+
+    /// Test-only: string identifier of the current transport's concrete type
+    /// (e.g. "WiFiTransport", "StarTransport"). For asserting post-swap state.
+    public var testHook_currentTransportKind: String {
+        lock.withLock { transport }.map { String(describing: type(of: $0)) } ?? "nil"
+    }
     #endif
 }

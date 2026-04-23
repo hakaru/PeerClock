@@ -222,7 +222,17 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
     /// Test-only: simulate `count` discovered peers to exercise the heuristic.
     /// Drives the decision logic directly — same entry point as the real
     /// `mesh.subscribePeers()` observer.
+    ///
+    /// Also cancels the real peer-observer task so WiFi peer-set deliveries
+    /// (which arrive as count=0 in a test environment with no real peers)
+    /// cannot race against and cancel the injected settle window.
     internal func testHook_injectDiscoveredPeers(count: Int) {
+        let obs = lock.withLock { () -> Task<Void, Never>? in
+            let t = peerObserverTask
+            peerObserverTask = nil
+            return t
+        }
+        obs?.cancel()
         onPeerCount(count)
     }
 
