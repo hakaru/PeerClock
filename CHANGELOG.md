@@ -5,6 +5,31 @@ All notable changes to PeerClock are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — Unreleased
+
+**Dual topology.** `PeerClock` now supports `.mesh` (v0.2.x-compatible), `.star` (new WebSocket-based, host-elected), and `.auto` (starts mesh, switches to star at peer count threshold). The v0.3.0-beta.1 star work is now exposed through the unified facade rather than requiring manual transport factory wiring.
+
+**v0.3.0 tag deprecated.** The previous `v0.3.0` tag was mislabeled (points to v0.2.x library code). v0.4.0 is the first version where `star` is a first-class facade mode. Consumers pinned to `from: "0.3.0"` should explicitly pin to `exactVersion: "0.4.0"` or `revision:` as appropriate.
+
+### Added
+
+- `Topology` enum: `.mesh`, `.star(role:)`, `.auto(heuristic:)`
+- `PeerClock(topology:)` init parameter (default `.mesh`)
+- `StarRole.clientOnly` for AUv3 extensions where `NWListener` is unsafe
+- `AutoHeuristic.peerCountThreshold(N)` (default N=5)
+- Star Bonjour service type `_peerclockstar._tcp` (separate from `_peerclock._tcp` to prevent mesh/star cross-discovery)
+- `WireCompatGoldenTests` — byte-identity tests for mesh `MessageCodec` output vs v0.2.x fixtures
+
+### Changed
+
+- `Transport.send(_:to:)` **removed** from the protocol. All delivery is via `broadcast(_:)`. Unicast semantics are now a recipient-filtering concern inside `CommandRouter` (uses existing `commandUnicast` wire type; filters at receive).
+- `PeerClock.init(transportFactory:)` **removed** from public API. Internal testing constructor remains `internal`.
+- Default `PeerClock()` now requires explicit awareness: v0.4.0 defaults to `.mesh`, which is wire-compat with v0.2.x. Migrating to star requires `PeerClock(topology: .star(role: .auto))`.
+
+### Deprecated
+
+- The v0.3.0 tag is left in place but the release page will be marked "Superseded by v0.4.0 — do not use".
+
 ## [0.3.0-alpha.3] — 2026-04-15
 
 **Star topology transport** for 1+N device sync, replacing full mesh. Designed for 10-device music recording sessions where one device naturally serves as control hub.
