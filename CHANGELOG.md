@@ -5,7 +5,30 @@ All notable changes to PeerClock are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.4.1] — Unreleased
+## [0.4.2] — 2026-04-23
+
+Safety patch from a post-release Codex + Gemini independent review of v0.4.1. Two race conditions and one test-coverage gap closed.
+
+### Fixed
+
+- **stop() vs in-flight auto-topology transition** race: if `stop()` ran while `handleTransition` was processing a `.meshToStar` event, the transition could complete after teardown and spawn new services on a stopped `PeerClock`. Fix: serialize via a new `isStopped` flag — `stop()` sets it and waits for `isTransitioning` to clear; `handleTransition` and `performMeshToStarTransition` both early-return when stopped, so the service rebuild is skipped once shutdown has begun. Reset in `start()` for restart-after-stop.
+- **Unsynchronized reads of mutable facade state.** `PeerClock.commands` and `PeerClock.now` read `commandRouter` / `syncEngine` without the lock while `restartServices` / `teardownServices` mutate them under it. Getters now take the lock for the property load.
+
+### Added
+
+- Regression tests:
+  - `AutoHotSwapTests.stopRacesInFlightTransition` — async-let both paths, assert clean teardown.
+  - `AutoHotSwapTests.restartAfterStop` — verify `isStopped` reset.
+  - `PeerStreamFanOutTests.cancellationRemovesContinuation` — onTermination cleans up dict.
+  - `PeerStreamFanOutTests.finishEmptiesDict` — finish() drops all subscribers.
+  - `PeerStreamFanOutTests.subscribeAfterFinishNoLeak` — post-finish subscribe leaves no state.
+- `PeerStreamFanOut.subscriberCount` DEBUG-only accessor for dict-size assertions.
+
+### Known deferred to v0.5
+
+- Public API surface cleanup: `HeartbeatMonitor`, `EventScheduler`, `StatusRegistry`, `StatusReceiver`, `Sleeper` family are `public` but should be `internal`. Demoting requires a breaking change to `heartbeatEvents: AsyncStream<HeartbeatMonitor.Event>` and siblings — reserved for a major bump.
+
+## [0.4.1] — 2026-04-23
 
 **`.auto` topology transitions now actually transition.** Closes the v0.4.0 gap
 where `.auto(peerCountThreshold:)` could detect the threshold crossing in
@@ -54,7 +77,7 @@ continued pointing to the mesh transport even after a "transition."
   before cancelling the prior one (under one lock acquisition for the
   swap-and-assign), shrinking the handoff loss window during transition.
 
-## [0.4.0] — Unreleased
+## [0.4.0] — 2026-04-23
 
 **Dual topology.** `PeerClock` now supports `.mesh` (v0.2.x-compatible), `.star` (new WebSocket-based, host-elected), and `.auto` (starts mesh, switches to star at peer count threshold). The v0.3.0-beta.1 star work is now exposed through the unified facade rather than requiring manual transport factory wiring.
 

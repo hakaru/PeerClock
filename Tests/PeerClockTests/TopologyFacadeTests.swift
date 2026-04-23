@@ -19,9 +19,9 @@ struct TopologyFacadeTests {
         }
     }
 
-    @Test("version is 0.4.1")
-    func versionIs041() {
-        #expect(PeerClock.version == "0.4.1")
+    @Test("version is 0.4.2")
+    func versionIs042() {
+        #expect(PeerClock.version == "0.4.2")
     }
 
     @Test("star topology starts and stops without throwing")

@@ -15,7 +15,7 @@ public final class PeerClock: @unchecked Sendable {
     // MARK: - Public Static
 
     /// Library version string (SemVer).
-    public static let version = "0.4.1"
+    public static let version = "0.4.2"
 
     // MARK: - Public Properties
 
