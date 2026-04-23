@@ -459,11 +459,26 @@ public final class PeerClock: @unchecked Sendable {
 
     /// Sends a command to a specific peer.
     ///
+    /// Since v0.4.0 transport-level unicast is removed (Q5:B). This method
+    /// broadcasts under the hood; the `to peer:` parameter is ignored at the
+    /// wire layer. Prefer ``broadcast(_:)`` with an application-level
+    /// recipient filter.
+    ///
     /// - Parameters:
     ///   - command: The command to send.
-    ///   - peer: Target peer identifier.
+    ///   - peer: Hint for the intended recipient (not enforced at transport).
+    @available(*, deprecated, message: "Transport-level unicast was removed in v0.4.0 (Q5:B). Use broadcast(_:) and filter recipients in the application payload.")
     public func send(_ command: Command, to peer: PeerID) async throws {
         guard let router = lock.withLock({ commandRouter }) else { return }
+        // Call through to the deprecated router.send to preserve current
+        // wire behaviour (commandUnicast type byte 0x11 retained for v0.2.x compat).
+        try await _withDeprecatedSend(router: router, command: command, peer: peer)
+    }
+
+    /// Internal shim so `send(_:to:)` can call the deprecated `CommandRouter.send`
+    /// without propagating a deprecation warning out of this file.
+    @available(*, deprecated)
+    private func _withDeprecatedSend(router: CommandRouter, command: Command, peer: PeerID) async throws {
         try await router.send(command, to: peer)
     }
 
