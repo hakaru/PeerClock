@@ -78,8 +78,8 @@ struct CommandRouterIdentityTests {
         )
         let data = MessageCodec.encode(message)
 
-        try await senderTransport.send(data, to: peerID)
-        try await senderTransport.send(data, to: peerID)
+        try await senderTransport.broadcast(data)
+        try await senderTransport.broadcast(data)
         try await Task.sleep(for: .milliseconds(150))
         receiveTask.cancel()
 
@@ -111,7 +111,7 @@ struct CommandRouterIdentityTests {
             .commandUnicast(commandID: UUID(), logicalVersion: 4, senderID: senderID, command: Command(type: "v4"))
         ]
         for message in messages {
-            try await senderTransport.send(MessageCodec.encode(message), to: peerID)
+            try await senderTransport.broadcast(MessageCodec.encode(message))
         }
 
         try await Task.sleep(for: .milliseconds(150))
@@ -156,8 +156,8 @@ struct CommandRouterIdentityTests {
             senderID: senderB,
             command: Command(type: "from-b")
         )
-        try await transportA.send(MessageCodec.encode(messageA), to: peerID)
-        try await transportB.send(MessageCodec.encode(messageB), to: peerID)
+        try await transportA.broadcast(MessageCodec.encode(messageA))
+        try await transportB.broadcast(MessageCodec.encode(messageB))
 
         _ = await receiveTask.value
         let types = Set(received.all.map(\.1.type))
@@ -190,7 +190,7 @@ struct CommandRouterIdentityTests {
                 senderID: senderID,
                 command: Command(type: "cmd-\(index)")
             )
-            try await senderTransport.send(MessageCodec.encode(message), to: peerID)
+            try await senderTransport.broadcast(MessageCodec.encode(message))
         }
 
         let replay = Message.commandUnicast(
@@ -199,7 +199,7 @@ struct CommandRouterIdentityTests {
             senderID: senderID,
             command: Command(type: "cmd-replayed")
         )
-        try await senderTransport.send(MessageCodec.encode(replay), to: peerID)
+        try await senderTransport.broadcast(MessageCodec.encode(replay))
         try await Task.sleep(for: .milliseconds(200))
         receiveTask.cancel()
 
@@ -234,10 +234,10 @@ struct CommandRouterIdentityTests {
         )
         let data = MessageCodec.encode(message)
 
-        try await senderTransport.send(data, to: peerID)
+        try await senderTransport.broadcast(data)
         try await Task.sleep(for: .milliseconds(50))
         peerRouter.forgetPeer(senderID)
-        try await senderTransport.send(data, to: peerID)
+        try await senderTransport.broadcast(data)
         try await Task.sleep(for: .milliseconds(150))
         receiveTask.cancel()
 

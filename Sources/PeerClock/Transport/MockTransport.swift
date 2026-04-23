@@ -149,16 +149,6 @@ public final class MockTransport: Transport, @unchecked Sendable {
         incomingMessagesContinuation.finish()
     }
 
-    public func send(_ data: Data, to peer: PeerID) async throws {
-        await network.send(
-            data,
-            from: localPeerID,
-            to: peer,
-            latency: latency,
-            packetDropProbability: packetDropProbability
-        )
-    }
-
     public func broadcast(_ data: Data) async throws {
         await network.broadcast(
             data,

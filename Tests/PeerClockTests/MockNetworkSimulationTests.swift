@@ -54,7 +54,7 @@ struct MockNetworkSimulationTests {
         try await transportB.start()
 
         await network.simulateDisconnect(peer: peerB)
-        try await transportA.send(Data([0x01, 0x02]), to: peerB)
+        try await transportA.broadcast(Data([0x01, 0x02]))
         try await Task.sleep(for: .milliseconds(50))
 
         let receiveTask = Task<[Data], Never> {

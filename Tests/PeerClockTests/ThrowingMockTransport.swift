@@ -41,10 +41,6 @@ final class ThrowingMockTransport: Transport, @unchecked Sendable {
         incomingContinuation.finish()
     }
 
-    func send(_ data: Data, to peer: PeerID) async throws {
-        throw FailureError(label: label)
-    }
-
     func broadcast(_ data: Data) async throws {
         throw FailureError(label: label)
     }

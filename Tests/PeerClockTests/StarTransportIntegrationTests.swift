@@ -47,9 +47,10 @@ struct StarTransportIntegrationTests {
         // Allow time for WebSocket handshake to complete.
         try await Task.sleep(for: .milliseconds(1000))
 
-        // Client → Host: send a test payload.
+        // Client → Host: broadcast a test payload (the client has a single
+        // upstream connection, so broadcast is the reliable send).
         let payload = Data("ping-test".utf8)
-        try await clientTransport.send(payload, to: PeerID(UUID()))
+        try await clientTransport.broadcast(payload)
 
         // Wait for the message to arrive at the host (with timeout).
         try await Task.sleep(for: .milliseconds(1000))
@@ -62,11 +63,11 @@ struct StarTransportIntegrationTests {
         await clientTransport.stop()
     }
 
-    /// Verify that a transport in undecided role throws StarTransportError on send.
+    /// Verify that a transport in undecided role throws StarTransportError on broadcast.
     @Test func undecidedRoleThrowsOnSend() async {
         let transport = StarTransport(localPeerID: PeerID(UUID()))
         await #expect(throws: StarTransportError.self) {
-            try await transport.send(Data("test".utf8), to: PeerID(UUID()))
+            try await transport.broadcast(Data("test".utf8))
         }
     }
 }

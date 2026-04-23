@@ -21,7 +21,7 @@ struct MockTransportTests {
             throw CancellationError()
         }
 
-        try await peerA.send(MessageCodec.encode(message), to: peerB.localPeerID)
+        try await peerA.broadcast(MessageCodec.encode(message))
         let received = try await receivedTask.value
         #expect(received == message)
 
@@ -32,9 +32,8 @@ struct MockTransportTests {
             throw CancellationError()
         }
 
-        try await peerB.send(
-            MessageCodec.encode(.pong(peerID: peerB.localPeerID, t0: 42, t1: 100, t2: 120)),
-            to: peerA.localPeerID
+        try await peerB.broadcast(
+            MessageCodec.encode(.pong(peerID: peerB.localPeerID, t0: 42, t1: 100, t2: 120))
         )
         let pong = try await pongTask.value
         #expect(pong == .pong(peerID: peerB.localPeerID, t0: 42, t1: 100, t2: 120))
@@ -85,7 +84,7 @@ struct MockTransportTests {
                 }
                 throw CancellationError()
             }
-            try await sender.send(MessageCodec.encode(.heartbeat), to: receiver.localPeerID)
+            try await sender.broadcast(MessageCodec.encode(.heartbeat))
             try await receiveTask.value
         }
 

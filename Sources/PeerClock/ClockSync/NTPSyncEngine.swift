@@ -193,13 +193,16 @@ public final class NTPSyncEngine: SyncEngine, @unchecked Sendable {
         // Clear previous round's measurements
         await collector.clear()
 
-        // SYNC_REQUEST 送信ループ
+        // SYNC_REQUEST 送信ループ。
+        // v0.4.0 (Q5:B) 以降、transport layer unicast は撤廃したため
+        // ping は全ピアに broadcast される。coordinator 以外からの pong
+        // は受信側 listener で `sender == coordinatorID` フィルタにより除外される。
         for _ in 0..<count {
             guard !Task.isCancelled else { break }
             let t0 = NTPSyncEngine.now()
             let message = Message.ping(peerID: localPeerID, t0: t0)
             let data = MessageCodec.encode(message)
-            try? await transport.send(data, to: coordinator)
+            try? await transport.broadcast(data)
 
             do {
                 try await Task.sleep(for: .seconds(interval))

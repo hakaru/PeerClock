@@ -728,7 +728,7 @@ public final class PeerClock: @unchecked Sendable {
         guard let syncStream else { return }
         let task = Task { [weak self] in
             guard let self else { return }
-            for await (sender, message) in syncStream {
+            for await (_, message) in syncStream {
                 guard !Task.isCancelled else { break }
                 guard case .ping(_, let t0) = message else { continue }
 
@@ -736,7 +736,10 @@ public final class PeerClock: @unchecked Sendable {
                 let t2 = NTPSyncEngine.now()
                 let response = Message.pong(peerID: self.localPeerID, t0: t0, t1: t1, t2: t2)
                 let responseData = MessageCodec.encode(response)
-                try? await transport.send(responseData, to: sender)
+                // v0.4.0 (Q5:B): transport-level unicast removed. The requester's
+                // NTPSyncEngine filters pongs by `sender == coordinatorID`, so
+                // broadcasting is safe — non-coordinators' pongs are dropped.
+                try? await transport.broadcast(responseData)
             }
         }
 

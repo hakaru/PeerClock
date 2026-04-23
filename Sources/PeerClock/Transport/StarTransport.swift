@@ -98,31 +98,6 @@ public final class StarTransport: Transport, @unchecked Sendable {
         logger.info("[StarTransport] stopped")
     }
 
-    public func send(_ data: Data, to peer: PeerID) async throws {
-        let target: SendTarget = lock.withLock { () -> SendTarget in
-            switch currentRole {
-            case .host:
-                return .host(self.host)
-            case .client:
-                return .client(self.client)
-            case .undecided:
-                return .none
-            }
-        }
-        switch target {
-        case .host(let h):
-            guard let h else { throw StarTransportError.notStarted }
-            // TODO(Plan B): resolve peerID → clientID for true unicast.
-            // For Plan A, host-mode send falls back to broadcast.
-            h.broadcast(data)
-        case .client(let c):
-            guard let c else { throw StarTransportError.notStarted }
-            c.send(data)
-        case .none:
-            throw StarTransportError.notStarted
-        }
-    }
-
     public func broadcast(_ data: Data) async throws {
         let target: SendTarget = lock.withLock { () -> SendTarget in
             switch currentRole {
