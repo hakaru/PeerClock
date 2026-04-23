@@ -52,4 +52,12 @@ internal final class PeerStreamFanOut<Value: Sendable>: @unchecked Sendable {
     internal var lastValue: Value? {
         lock.withLock { last }
     }
+
+    #if DEBUG
+    /// Test-only: observable subscriber count. Drops to zero when every
+    /// `subscribe()` result's iterator is cancelled or finished.
+    internal var subscriberCount: Int {
+        lock.withLock { continuations.count }
+    }
+    #endif
 }
