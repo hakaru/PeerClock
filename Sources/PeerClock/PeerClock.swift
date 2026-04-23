@@ -43,7 +43,7 @@ public final class PeerClock: @unchecked Sendable {
 
     /// Stream of incoming application commands from remote peers.
     public var commands: AsyncStream<(PeerID, Command)> {
-        commandRouter?.incomingCommands ?? AsyncStream { $0.finish() }
+        lock.withLock { commandRouter }?.incomingCommands ?? AsyncStream { $0.finish() }
     }
 
     // MARK: - Computed
@@ -54,7 +54,11 @@ public final class PeerClock: @unchecked Sendable {
     /// clock. Agrees across all synced peers within +/-2 ms.
     public var now: UInt64 {
         let machNow = NTPSyncEngine.now()
-        let offsetNs = Int64((syncEngine?.currentOffset ?? 0.0) * 1_000_000_000)
+        // `syncEngine` is mutated under `lock` by `restartServices` /
+        // `teardownServices`; read it under the same lock to avoid a
+        // Swift 6 data race on the optional load.
+        let offset = lock.withLock { syncEngine }?.currentOffset ?? 0.0
+        let offsetNs = Int64(offset * 1_000_000_000)
         return UInt64(Int64(machNow) + offsetNs)
     }
 
