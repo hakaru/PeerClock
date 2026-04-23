@@ -1,4 +1,7 @@
 import Foundation
+import os.signpost
+
+private let topologySignposter = OSSignposter(subsystem: "net.hakaru.PeerClock", category: "Topology")
 
 /// Auto-topology runtime. Starts as `MeshRuntime`; when the peer-count
 /// heuristic fires (and remains above threshold for `settleWindow`), stops
@@ -113,6 +116,10 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
     }
 
     private func transitionToStar() async {
+        let signpostID = topologySignposter.makeSignpostID()
+        let interval = topologySignposter.beginInterval("mesh→star", id: signpostID)
+        defer { topologySignposter.endInterval("mesh→star", interval) }
+
         let shouldTransition: Bool = lock.withLock {
             _mode == .mesh
         }
