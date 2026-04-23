@@ -107,20 +107,22 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
     }
 
     /// (Re-)subscribe to the active inner runtime's `connectionEvents` stream.
-    /// Cancels any prior forwarder and spawns a new one.
+    /// Spawns the new forwarder first, then atomically swaps-and-cancels the
+    /// prior one under the lock — shrinks the handoff loss window to just the
+    /// time the two subscribers co-exist.
     private func spawnConnectionEventForwarder(from runtime: any TopologyRuntime) {
-        let prior = lock.withLock { () -> Task<Void, Never>? in
-            let p = connectionEventForwardTask
-            return p
-        }
-        prior?.cancel()
         let cont = connectionEventsContinuation
         let task = Task {
             for await event in runtime.connectionEvents {
                 cont.yield(event)
             }
         }
-        lock.withLock { self.connectionEventForwardTask = task }
+        let prior = lock.withLock { () -> Task<Void, Never>? in
+            let p = connectionEventForwardTask
+            self.connectionEventForwardTask = task
+            return p
+        }
+        prior?.cancel()
     }
 
     func stop() async {
@@ -185,6 +187,10 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
     /// Perform the physical mesh → star swap. Called explicitly by
     /// `PeerClock` after it has drained downstream services. Idempotent:
     /// a no-op if already in `.star`.
+    ///
+    /// Rollback-safe: star is started BEFORE mesh is stopped. If
+    /// `star.start()` throws, mesh keeps serving traffic and the service
+    /// layer stays bound to a live transport.
     internal func performTransition() async throws {
         let old: (any TopologyRuntime)? = lock.withLock {
             guard _mode == .mesh else { return nil }
@@ -196,7 +202,14 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
         let interval = topologySignposter.beginInterval("mesh→star", id: signpostID)
         defer { topologySignposter.endInterval("mesh→star", interval) }
 
-        // Tear down the mesh peer observer and the mesh runtime itself.
+        // Start star first. If this throws, mesh is still alive — caller
+        // sees the error, bails out, and everything downstream keeps working.
+        // Mesh (`_peerclock._udp`) and star (`_peerclockstar._tcp`) advertise
+        // on distinct Bonjour service types, so they don't compete.
+        let star = StarRuntime(localPeerID: localPeerID, role: .auto, configuration: configuration)
+        try await star.start()
+
+        // Star is up; now tear down the mesh peer observer and the mesh runtime.
         let priorPeerObs = lock.withLock { () -> Task<Void, Never>? in
             let p = peerObserverTask; peerObserverTask = nil
             return p
@@ -204,8 +217,6 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
         priorPeerObs?.cancel()
         await old.stop()
 
-        let star = StarRuntime(localPeerID: localPeerID, role: .auto, configuration: configuration)
-        try await star.start()
         lock.withLock {
             self.active = star
             self._mode = .star

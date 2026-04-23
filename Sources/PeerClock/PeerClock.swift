@@ -15,7 +15,7 @@ public final class PeerClock: @unchecked Sendable {
     // MARK: - Public Static
 
     /// Library version string (SemVer).
-    public static let version = "0.4.0"
+    public static let version = "0.4.1"
 
     // MARK: - Public Properties
 
@@ -159,6 +159,12 @@ public final class PeerClock: @unchecked Sendable {
 
     private var knownPeers: Set<PeerID> = []
     private var currentCoordinator: PeerID?
+
+    /// Re-entrancy guard for `handleTransition`. `AutoRuntime` currently only
+    /// emits `.meshToStar` once (no reverse), but `restartServices` re-subscribes
+    /// to `runtime.transitionEvents` and a mis-fired duplicate event would
+    /// needlessly tear down and rebuild the service layer. Gated under `lock`.
+    private var isTransitioning: Bool = false
 
     // MARK: - Init
 
@@ -546,7 +552,22 @@ public final class PeerClock: @unchecked Sendable {
     // MARK: - Private: Topology Transition Handling
 
     /// Dispatches transition events emitted by `runtime.transitionEvents`.
+    ///
+    /// Guarded against re-entrancy: if a previous transition is in flight
+    /// (or a subsequent duplicate event arrives after `restartServices`
+    /// re-subscribes), the second call is dropped.
     private func handleTransition(_ event: TopologyTransition) async {
+        let shouldProceed = lock.withLock { () -> Bool in
+            if isTransitioning { return false }
+            isTransitioning = true
+            return true
+        }
+        guard shouldProceed else {
+            pcLogger.info("[Transition] drop duplicate/overlapping event \(String(describing: event.kind), privacy: .public)")
+            return
+        }
+        defer { lock.withLock { isTransitioning = false } }
+
         switch event.kind {
         case .meshToStar:
             await performMeshToStarTransition()

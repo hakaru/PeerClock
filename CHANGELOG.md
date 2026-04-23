@@ -43,6 +43,16 @@ continued pointing to the mesh transport even after a "transition."
   peer-observer task (which was immediately overwriting the injected count
   with `0` from empty `transport.peers` yields in unit-test environments).
   The DEBUG hook now cancels the real observer on first call.
+- `AutoRuntime.performTransition()` is now rollback-safe: the new star runtime
+  is started **before** the mesh runtime is stopped, so a failed
+  `star.start()` leaves mesh alive and the service layer bound to a live
+  transport instead of a stopped one.
+- `PeerClock.handleTransition` gains a re-entrancy guard so a duplicate
+  `.meshToStar` event (e.g. from the subscriber re-attaching after
+  `restartServices`) does not trigger an extra teardown/rebuild.
+- `AutoRuntime.spawnConnectionEventForwarder` now starts the new forwarder
+  before cancelling the prior one (under one lock acquisition for the
+  swap-and-assign), shrinking the handoff loss window during transition.
 
 ## [0.4.0] — Unreleased
 
