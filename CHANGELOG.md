@@ -19,12 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `AutoHeuristic.peerCountThreshold(N)` (default N=5)
 - Star Bonjour service type `_peerclockstar._tcp` (separate from `_peerclock._tcp` to prevent mesh/star cross-discovery)
 - `WireCompatGoldenTests` — byte-identity tests for mesh `MessageCodec` output vs v0.2.x fixtures
+- `ConnectionEvent` observability type + `PeerClock.connectionEvents: AsyncStream<ConnectionEvent>` for surfacing star handshake failures, timeouts, rejections, and disconnects (producers in StarClient/StarHost/StarTransport wire in a follow-up).
 
 ### Changed
 
 - `Transport.send(_:to:)` **removed** from the protocol. All delivery is via `broadcast(_:)`. Unicast semantics are now a recipient-filtering concern inside `CommandRouter` (uses existing `commandUnicast` wire type; filters at receive).
 - `PeerClock.init(transportFactory:)` **removed** from public API. Internal testing constructor remains `internal`.
 - Default `PeerClock()` now requires explicit awareness: v0.4.0 defaults to `.mesh`, which is wire-compat with v0.2.x. Migrating to star requires `PeerClock(topology: .star(role: .auto))`.
+- **Renamed** `PeerClock.connectionEvents` (previously `AsyncStream<HeartbeatMonitor.Event>`) to `PeerClock.heartbeatEvents`. The `connectionEvents` name now exposes the new `AsyncStream<ConnectionEvent>` described above. Affects any downstream consumer observing heartbeat state transitions (none known outside the Examples demo).
 
 ### Deprecated
 
