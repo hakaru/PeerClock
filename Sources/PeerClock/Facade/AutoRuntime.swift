@@ -3,16 +3,16 @@ import os.signpost
 
 private let topologySignposter = OSSignposter(subsystem: "net.hakaru.PeerClock", category: "Topology")
 
-/// Auto-topology runtime. Starts as `MeshRuntime`; when the peer-count
-/// heuristic fires (and remains above threshold for `settleWindow`), emits a
-/// `TopologyTransition(.meshToStar)` on `transitionEvents`. The physical swap
-/// is no longer performed inline — `PeerClock` observes the event, drains
-/// downstream services, then calls back into `performTransition()` to execute
-/// the swap. No reverse transition.
+/// Auto-topology runtime. Starts as `MeshRuntime`; observes peer count via
+/// `MeshRuntime.subscribePeers()`. When the `AutoHeuristic` threshold is
+/// crossed and holds for `settleWindow`, emits a `TopologyTransition` on
+/// `transitionEvents`. `PeerClock` subscribes and orchestrates the physical
+/// swap by calling `performTransition()` followed by its own
+/// `restartServices(transport:)` against the new star transport.
 ///
-/// Real peer-count observation is now wired through `MeshRuntime.subscribePeers()`
-/// (Phase 1 fan-out). Tests may still inject counts synthetically via
-/// `testHook_injectDiscoveredPeers(_:)`.
+/// No reverse transition: once `.star`, stays `.star` for the lifetime of
+/// this instance. Callers that want a fresh mesh start must stop and create
+/// a new `PeerClock(topology: .mesh)`.
 internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
     enum Mode: Sendable, Equatable { case mesh, star }
 

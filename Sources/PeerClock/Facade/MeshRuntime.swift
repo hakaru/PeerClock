@@ -2,15 +2,14 @@ import Foundation
 
 /// Owns the mesh-topology transport lifecycle behind the ``PeerClock`` facade.
 ///
-/// Phase 2 scope: transport lifecycle plus a peer-set fan-out. `CommandRouter`,
-/// `NTPSyncEngine`, `HeartbeatMonitor`, `StatusRegistry`, and the legacy
-/// peer-forwarding coordination loop remain owned by ``PeerClock`` itself and
-/// are wired against `runtime.transport` after `start()`.
+/// Spawns a `transport.peers` observer that fans out `[Peer]` updates via
+/// `PeerStreamFanOut`, so `PeerClock.runCoordinationLoop` and `AutoRuntime`
+/// can subscribe independently without starving each other on the underlying
+/// single-consumer `AsyncStream<Set<PeerID>>`.
 ///
-/// `subscribePeers()` / `peerStream` now return real `[Peer]` values derived
-/// from `transport.peers`. Because `PeerStreamFanOut` is 1-to-N, the existing
-/// `runCoordinationLoop` inside ``PeerClock`` (which still iterates
-/// `transport.peers` directly) continues to receive events without starvation.
+/// `commandStream` remains a never-yielding placeholder — mesh-mode commands
+/// still flow through `PeerClock`'s own `CommandRouter` rather than through
+/// the runtime's protocol-level stream. That plumbing is a separate refactor.
 internal final class MeshRuntime: TopologyRuntime, @unchecked Sendable {
     let transport: any Transport
     let commandStream: AsyncStream<(PeerID, Command)>
