@@ -36,4 +36,28 @@ struct StarRuntimeTests {
         )
         #expect(rt.transport is StarTransport)
     }
+
+    @Test("clientOnly role skips HostElection")
+    func clientOnlySkipsElection() async throws {
+        let rt = StarRuntime(
+            localPeerID: PeerID(UUID()),
+            role: .clientOnly,
+            configuration: .default
+        )
+        try await rt.start()
+        #expect(rt.testHook_election == nil)
+        await rt.stop()
+    }
+
+    @Test("auto role starts HostElection")
+    func autoStartsElection() async throws {
+        let rt = StarRuntime(
+            localPeerID: PeerID(UUID()),
+            role: .auto,
+            configuration: .default
+        )
+        try await rt.start()
+        #expect(rt.testHook_election != nil)
+        await rt.stop()
+    }
 }

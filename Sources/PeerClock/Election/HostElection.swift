@@ -134,7 +134,9 @@ public actor HostElection {
     }
 
     private func handlePeerSetChange(_ peers: [BonjourBrowser.DiscoveredPeer]) async {
-        lastPeers = peers
+        // Client-only peers (role=="client-only") must never be elected host.
+        // See docs/spec/client-only-role.md.
+        lastPeers = peers.filter { $0.role != "client-only" }
         // Settle period: wait after last change before re-evaluating (debounce thrashing)
         settleTask?.cancel()
         let settlePeriod = timing.settlePeriod
