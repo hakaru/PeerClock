@@ -241,28 +241,70 @@ public final class PeerClock: @unchecked Sendable {
         lock.withLock { self.runtime = rt }
         try await rt.start()
 
-        // Forward the topology runtime's observability events into the
-        // public `connectionEvents` stream. Runs until `stop()` cancels it.
+        let tr = rt.transport
+        lock.withLock { self.transport = tr }
+        await restartServices(transport: tr)
+    }
+
+    /// Stops synchronization and disconnects from all peers.
+    public func stop() async {
+        await teardownServices()
+
+        let rt = lock.withLock { () -> (any TopologyRuntime)? in
+            let r = runtime
+            runtime = nil
+            transport = nil
+            return r
+        }
+        await rt?.stop()
+
+        lock.withLock {
+            self.lastSyncState = .idle
+            self.lastSyncedAtNs = nil
+        }
+        syncStateContinuation.yield(.idle)
+    }
+
+    // MARK: - Private: Service Lifecycle
+
+    /// Build (or rebuild) the downstream services layer against the given transport.
+    ///
+    /// On a fresh `start()`, existing service state is `nil`, so this is a
+    /// pure build. On auto-topology hot-swap (Task 3.2), service state already
+    /// exists — the method tears it down first, then rebuilds against the new
+    /// transport.
+    ///
+    /// Requires `self.runtime` to already be set and started (transport live).
+    private func restartServices(transport: any Transport) async {
+        // 1. Tear down any previously wired services. Safe to call unconditionally
+        //    — a fresh start has nothing to tear down and this is a no-op.
+        await teardownServices()
+
+        // 2. Subscribe to the current runtime's connectionEvents. We resubscribe
+        //    on every swap so post-swap handshake failures surface on
+        //    `PeerClock.connectionEvents`.
+        let rt = lock.withLock { self.runtime }
         let connEventsCont = self.connectionEventsContinuation
-        let eventsForwardTask = Task {
-            for await event in rt.connectionEvents {
-                connEventsCont.yield(event)
+        let eventsForwardTask: Task<Void, Never>? = rt.map { runtime in
+            Task {
+                for await event in runtime.connectionEvents {
+                    connEventsCont.yield(event)
+                }
             }
         }
-        lock.withLock { self.connectionEventsForwardTask = eventsForwardTask }
 
-        let tr: any Transport = lock.withLock {
-            let newTransport = rt.transport
-            self.transport = newTransport
+        // 3. Rebuild services against `transport`.
+        lock.withLock {
+            self.transport = transport
 
             let elec = CoordinatorElection(localPeerID: localPeerID)
             self.election = elec
 
-            let router = CommandRouter(transport: newTransport, localPeerID: localPeerID)
+            let router = CommandRouter(transport: transport, localPeerID: localPeerID)
             self.commandRouter = router
 
             let eng = NTPSyncEngine(
-                transport: newTransport,
+                transport: transport,
                 localPeerID: localPeerID,
                 configuration: configuration,
                 syncResponseStream: router.syncResponses
@@ -281,10 +323,10 @@ public final class PeerClock: @unchecked Sendable {
             // 自分自身は最初から既知ピアに含める
             knownPeers = [localPeerID]
 
-            return newTransport
+            self.connectionEventsForwardTask = eventsForwardTask
         }
 
-        // Status / Heartbeat actors を構築（self を weak キャプチャして transport を参照）
+        // 4. Status / Heartbeat actors を構築（self を weak キャプチャして transport を参照）
         let registry = StatusRegistry(
             localPeerID: localPeerID,
             debounce: configuration.statusSendDebounce
@@ -309,7 +351,7 @@ public final class PeerClock: @unchecked Sendable {
             self.heartbeatMonitor = heartbeat
         }
 
-        // Transport was started by `rt.start()` above — do not double-start.
+        // Transport was started by the runtime — do not double-start.
 
         syncStateContinuation.yield(.discovering)
 
@@ -411,7 +453,8 @@ public final class PeerClock: @unchecked Sendable {
         // 受け取る。MeshRuntime は `transport.peers` を fan-out し複数サブスクラ
         // イバに配信するため、このループと他の観測者 (AutoRuntime 等) が
         // single-consumer 争奪で饑餓化することはない。
-        let peersStream = rt.peerStream
+        let peersStream: AsyncStream<[Peer]> = lock.withLock { self.runtime }?.peerStream
+            ?? AsyncStream { $0.finish() }
         let coordTask = Task { [weak self] in
             guard let self else { return }
             await self.runCoordinationLoop(peerStream: peersStream)
@@ -419,9 +462,15 @@ public final class PeerClock: @unchecked Sendable {
         lock.withLock { self.coordinationTask = coordTask }
     }
 
-    /// Stops synchronization and disconnects from all peers.
-    public func stop() async {
-        let (coordTask, syncResponder, fwdTask, hbTask, spTask, hbElecTask, djTask, ceTask, eng, rt, registry, receiver, heartbeat, sched) = lock.withLock {
+    /// Cancel and await service-layer tasks and components.
+    ///
+    /// Does NOT touch `runtime` or `transport` — that's the caller's
+    /// responsibility. Shared by `stop()` and `restartServices(transport:)`
+    /// (hot-swap). Mirrors the parallelized cancel/await pattern: cancel all
+    /// tasks synchronously, then await task termination + component shutdown
+    /// concurrently via `async let`.
+    private func teardownServices() async {
+        let (coordTask, syncResponder, fwdTask, hbTask, spTask, hbElecTask, djTask, ceTask, eng, registry, receiver, heartbeat, sched) = lock.withLock {
             let c = coordinationTask; coordinationTask = nil
             let s = syncResponderTask; syncResponderTask = nil
             let f = syncStateForwardTask; syncStateForwardTask = nil
@@ -430,13 +479,15 @@ public final class PeerClock: @unchecked Sendable {
             let he = heartbeatElectionTask; heartbeatElectionTask = nil
             let dj = driftJumpRoutingTask; driftJumpRoutingTask = nil
             let ce = connectionEventsForwardTask; connectionEventsForwardTask = nil
-            let e = syncEngine
-            let r = runtime
+            let e = syncEngine; syncEngine = nil
             let reg = statusRegistry; statusRegistry = nil
             let rec = statusReceiver; statusReceiver = nil
             let hb = heartbeatMonitor; heartbeatMonitor = nil
             let sc = eventScheduler; eventScheduler = nil
-            return (c, s, f, h, sp, he, dj, ce, e, r, reg, rec, hb, sc)
+            election = nil
+            commandRouter = nil
+            driftMonitor = nil
+            return (c, s, f, h, sp, he, dj, ce, e, reg, rec, hb, sc)
         }
 
         // Cancel routing/coord tasks synchronously.
@@ -449,10 +500,8 @@ public final class PeerClock: @unchecked Sendable {
         djTask?.cancel()
         ceTask?.cancel()
 
-        // Await task termination AND component/transport shutdown concurrently,
-        // so a hang in any single shutdown path does not hold transport
-        // teardown hostage. `rt?.stop()` tears down the transport; all other
-        // awaits are independent.
+        // Await task termination AND component shutdown concurrently, so a
+        // hang in any single shutdown path does not hold the rest hostage.
         async let coordAwait: Void? = coordTask?.value
         async let syncRespAwait: Void? = syncResponder?.value
         async let fwdAwait: Void? = fwdTask?.value
@@ -466,19 +515,9 @@ public final class PeerClock: @unchecked Sendable {
         async let receiverShutdown: Void? = receiver?.shutdown()
         async let heartbeatShutdown: Void? = heartbeat?.stop()
         async let schedShutdown: Void? = sched?.shutdown()
-        // Transport shutdown is delegated to the topology runtime.
-        async let rtShutdown: Void? = rt?.stop()
 
         _ = await (coordAwait, syncRespAwait, fwdAwait, hbAwait, spAwait, hbElecAwait, djAwait, ceAwait)
-        _ = await (engShutdown, registryShutdown, receiverShutdown, heartbeatShutdown, schedShutdown, rtShutdown)
-
-        lock.withLock {
-            self.lastSyncState = .idle
-            self.lastSyncedAtNs = nil
-            self.transport = nil
-            self.runtime = nil
-        }
-        syncStateContinuation.yield(.idle)
+        _ = await (engShutdown, registryShutdown, receiverShutdown, heartbeatShutdown, schedShutdown)
     }
 
     /// Sends a command to a specific peer.
