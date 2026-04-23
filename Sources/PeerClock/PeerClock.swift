@@ -111,6 +111,7 @@ public final class PeerClock: @unchecked Sendable {
     // MARK: - Private: Components
 
     private let lock = NSLock()
+    private var runtime: (any TopologyRuntime)?
     private var transport: (any Transport)?
     private var election: CoordinatorElection?
     private var syncEngine: NTPSyncEngine?
@@ -204,8 +205,22 @@ public final class PeerClock: @unchecked Sendable {
     ///
     /// - Throws: Transport-level errors, such as denied network permission.
     public func start() async throws {
-        let tr: any Transport = lock.withLock {
+        // Select runtime based on topology. MeshRuntime owns the transport
+        // lifecycle; star/auto runtimes wire in Task 2.4 / 4.x.
+        let rt: any TopologyRuntime
+        switch topology {
+        case .mesh:
             let newTransport = transportFactory(localPeerID)
+            rt = MeshRuntime(transport: newTransport)
+        case .star, .auto:
+            preconditionFailure("star/auto runtime wired in Task 2.4/4.x")
+        }
+
+        lock.withLock { self.runtime = rt }
+        try await rt.start()
+
+        let tr: any Transport = lock.withLock {
+            let newTransport = rt.transport
             self.transport = newTransport
 
             let elec = CoordinatorElection(localPeerID: localPeerID)
@@ -262,7 +277,7 @@ public final class PeerClock: @unchecked Sendable {
             self.heartbeatMonitor = heartbeat
         }
 
-        try await tr.start()
+        // Transport was started by `rt.start()` above — do not double-start.
 
         syncStateContinuation.yield(.discovering)
 
@@ -369,7 +384,7 @@ public final class PeerClock: @unchecked Sendable {
 
     /// Stops synchronization and disconnects from all peers.
     public func stop() async {
-        let (coordTask, syncResponder, fwdTask, hbTask, spTask, hbElecTask, djTask, eng, tr, registry, receiver, heartbeat, sched) = lock.withLock {
+        let (coordTask, syncResponder, fwdTask, hbTask, spTask, hbElecTask, djTask, eng, rt, registry, receiver, heartbeat, sched) = lock.withLock {
             let c = coordinationTask; coordinationTask = nil
             let s = syncResponderTask; syncResponderTask = nil
             let f = syncStateForwardTask; syncStateForwardTask = nil
@@ -378,12 +393,12 @@ public final class PeerClock: @unchecked Sendable {
             let he = heartbeatElectionTask; heartbeatElectionTask = nil
             let dj = driftJumpRoutingTask; driftJumpRoutingTask = nil
             let e = syncEngine
-            let t = transport
+            let r = runtime
             let reg = statusRegistry; statusRegistry = nil
             let rec = statusReceiver; statusReceiver = nil
             let hb = heartbeatMonitor; heartbeatMonitor = nil
             let sc = eventScheduler; eventScheduler = nil
-            return (c, s, f, h, sp, he, dj, e, t, reg, rec, hb, sc)
+            return (c, s, f, h, sp, he, dj, e, r, reg, rec, hb, sc)
         }
 
         coordTask?.cancel()
@@ -407,11 +422,14 @@ public final class PeerClock: @unchecked Sendable {
         await receiver?.shutdown()
         await heartbeat?.stop()
         await sched?.shutdown()
-        await tr?.stop()
+        // Transport shutdown is delegated to the topology runtime.
+        await rt?.stop()
 
         lock.withLock {
             self.lastSyncState = .idle
             self.lastSyncedAtNs = nil
+            self.transport = nil
+            self.runtime = nil
         }
         syncStateContinuation.yield(.idle)
     }
