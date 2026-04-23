@@ -406,10 +406,15 @@ public final class PeerClock: @unchecked Sendable {
         }()
         try? await registry.setStatus(deviceName, forKey: StatusKeys.deviceName)
 
-        // メイン協調タスクを開始
+        // メイン協調タスクを開始。
+        // Peer 更新は Transport ではなく TopologyRuntime の `peerStream` から
+        // 受け取る。MeshRuntime は `transport.peers` を fan-out し複数サブスクラ
+        // イバに配信するため、このループと他の観測者 (AutoRuntime 等) が
+        // single-consumer 争奪で饑餓化することはない。
+        let peersStream = rt.peerStream
         let coordTask = Task { [weak self] in
             guard let self else { return }
-            await self.runCoordinationLoop(transport: tr)
+            await self.runCoordinationLoop(peerStream: peersStream)
         }
         lock.withLock { self.coordinationTask = coordTask }
     }
@@ -627,10 +632,13 @@ public final class PeerClock: @unchecked Sendable {
 
     // MARK: - Private: Coordination Loop
 
-    private func runCoordinationLoop(transport: any Transport) async {
+    private func runCoordinationLoop(peerStream: AsyncStream<[Peer]>) async {
         pcLogger.info("[CoordLoop] started, waiting for peers stream")
-        for await peers in transport.peers {
+        for await peerList in peerStream {
             guard !Task.isCancelled else { break }
+            // Fan-out subscription delivers `[Peer]`; coordination logic below
+            // is historically keyed on `Set<PeerID>`. Convert once at the top.
+            let peers = Set(peerList.map(\.id))
             pcLogger.info("[CoordLoop] peers update: \(peers.count) peers — \(peers.map { $0.description }.joined(separator: ", "), privacy: .public)")
 
             let (newPeerList, elec, eng, hb, prevKnown) = lock.withLock {
@@ -728,7 +736,9 @@ public final class PeerClock: @unchecked Sendable {
                 // 自分がコーディネーター: 同期エンジンを停止し、レスポンダーを起動
                 pcLogger.info("[CoordLoop] I am coordinator — starting sync responder")
                 await eng.stop()
-                startSyncResponder(transport: transport)
+                if let tr = lock.withLock({ self.transport }) {
+                    startSyncResponder(transport: tr)
+                }
             } else if let coordinator {
                 // 自分はフォロワー: レスポンダーを停止し、同期エンジンを起動
                 pcLogger.info("[CoordLoop] I am follower — starting NTP sync with coordinator \(coordinator.description, privacy: .public)")
