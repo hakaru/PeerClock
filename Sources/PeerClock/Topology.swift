@@ -3,7 +3,7 @@ import Foundation
 /// Network topology selection for a `PeerClock` instance.
 ///
 /// See `docs/spec/topology.md`.
-public enum Topology: Sendable {
+public enum Topology: Sendable, Equatable {
     case mesh
     case star(role: StarRole)
     case auto(heuristic: AutoHeuristic)

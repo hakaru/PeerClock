@@ -22,6 +22,9 @@ public final class PeerClock: @unchecked Sendable {
     /// Unique identifier for this peer, generated at init.
     public let localPeerID: PeerID
 
+    /// The configured topology for this instance.
+    public let topology: Topology
+
     // MARK: - Public Streams
 
     /// Stream of synchronization state changes.
@@ -147,21 +150,43 @@ public final class PeerClock: @unchecked Sendable {
 
     // MARK: - Init
 
-    /// Creates a new `PeerClock` instance.
+    /// Creates a new `PeerClock` instance with a chosen topology.
     ///
     /// - Parameters:
+    ///   - topology: Network topology. Default `.mesh` preserves v0.2.x wire compatibility.
     ///   - configuration: Runtime parameters. Defaults to ``Configuration/default``.
-    ///   - transportFactory: Optional factory for custom or mock transports.
-    ///     When `nil`, `WiFiTransport` is used.
     public init(
-        configuration: Configuration = .default,
-        transportFactory: (@Sendable (PeerID) -> any Transport)? = nil
+        topology: Topology = .mesh,
+        configuration: Configuration = .default
     ) {
         self.localPeerID = PeerID(UUID())
         self.configuration = configuration
-        self.transportFactory = transportFactory ?? { peerID in
+        self.topology = topology
+
+        // Transport factory derived from topology. Star/auto wiring lands in later Phase 2/4 tasks.
+        self.transportFactory = { peerID in
             WiFiTransport(localPeerID: peerID, configuration: configuration)
         }
+
+        var syncStateCont: AsyncStream<SyncState>.Continuation!
+        var peersCont: AsyncStream<[Peer]>.Continuation!
+
+        self.syncState = AsyncStream { syncStateCont = $0 }
+        self.peers = AsyncStream { peersCont = $0 }
+
+        self.syncStateContinuation = syncStateCont
+        self.peersContinuation = peersCont
+    }
+
+    /// Testing-only init that injects a custom `Transport` factory. Topology is implicitly `.mesh`.
+    internal init(
+        configuration: Configuration = .default,
+        transportFactory: @escaping @Sendable (PeerID) -> any Transport
+    ) {
+        self.localPeerID = PeerID(UUID())
+        self.configuration = configuration
+        self.topology = .mesh
+        self.transportFactory = transportFactory
 
         var syncStateCont: AsyncStream<SyncState>.Continuation!
         var peersCont: AsyncStream<[Peer]>.Continuation!
