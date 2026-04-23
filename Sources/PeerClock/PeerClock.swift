@@ -212,8 +212,10 @@ public final class PeerClock: @unchecked Sendable {
         case .mesh:
             let newTransport = transportFactory(localPeerID)
             rt = MeshRuntime(transport: newTransport)
-        case .star, .auto:
-            preconditionFailure("star/auto runtime wired in Task 2.4/4.x")
+        case .star(let role):
+            rt = StarRuntime(localPeerID: localPeerID, role: role, configuration: configuration)
+        case .auto:
+            preconditionFailure("auto runtime wired in Task 4.x")
         }
 
         lock.withLock { self.runtime = rt }
