@@ -33,6 +33,16 @@ public final class PeerClock: @unchecked Sendable {
     /// Stream of discovered peers on the local network.
     public let peers: AsyncStream<[Peer]>
 
+    /// Stream of observability events about connection lifecycle (star
+    /// handshake failures, timeouts, rejections, disconnects). Consumers
+    /// use this for analytics or UI. Events originate from the star
+    /// transport's failure paths.
+    ///
+    /// Emits only in star/auto topologies. Empty in pure mesh. As of v0.4.0
+    /// real producers in ``StarClient`` / ``StarHost`` / ``StarTransport`` are
+    /// not yet wired — tracked as follow-up tech debt.
+    public let connectionEvents: AsyncStream<ConnectionEvent>
+
     /// Stream of incoming application commands from remote peers.
     public var commands: AsyncStream<(PeerID, Command)> {
         commandRouter?.incomingCommands ?? AsyncStream { $0.finish() }
@@ -143,6 +153,7 @@ public final class PeerClock: @unchecked Sendable {
 
     private let syncStateContinuation: AsyncStream<SyncState>.Continuation
     private let peersContinuation: AsyncStream<[Peer]>.Continuation
+    private let connectionEventsContinuation: AsyncStream<ConnectionEvent>.Continuation
 
     // MARK: - Private: State
 
@@ -171,12 +182,15 @@ public final class PeerClock: @unchecked Sendable {
 
         var syncStateCont: AsyncStream<SyncState>.Continuation!
         var peersCont: AsyncStream<[Peer]>.Continuation!
+        var connectionEventsCont: AsyncStream<ConnectionEvent>.Continuation!
 
         self.syncState = AsyncStream { syncStateCont = $0 }
         self.peers = AsyncStream { peersCont = $0 }
+        self.connectionEvents = AsyncStream { connectionEventsCont = $0 }
 
         self.syncStateContinuation = syncStateCont
         self.peersContinuation = peersCont
+        self.connectionEventsContinuation = connectionEventsCont
     }
 
     /// Testing-only init that injects a custom `Transport` factory. Topology is implicitly `.mesh`.
@@ -191,12 +205,15 @@ public final class PeerClock: @unchecked Sendable {
 
         var syncStateCont: AsyncStream<SyncState>.Continuation!
         var peersCont: AsyncStream<[Peer]>.Continuation!
+        var connectionEventsCont: AsyncStream<ConnectionEvent>.Continuation!
 
         self.syncState = AsyncStream { syncStateCont = $0 }
         self.peers = AsyncStream { peersCont = $0 }
+        self.connectionEvents = AsyncStream { connectionEventsCont = $0 }
 
         self.syncStateContinuation = syncStateCont
         self.peersContinuation = peersCont
+        self.connectionEventsContinuation = connectionEventsCont
     }
 
     // MARK: - Public API
@@ -499,7 +516,7 @@ public final class PeerClock: @unchecked Sendable {
     }
 
     /// Stream of heartbeat connection state transitions.
-    public var connectionEvents: AsyncStream<HeartbeatMonitor.Event> {
+    public var heartbeatEvents: AsyncStream<HeartbeatMonitor.Event> {
         lock.withLock { heartbeatMonitor }?.events ?? AsyncStream { $0.finish() }
     }
 
@@ -769,4 +786,16 @@ public final class PeerClock: @unchecked Sendable {
 
         lock.withLock { syncResponderTask = task }
     }
+
+    // MARK: - Test Hooks (DEBUG)
+
+    #if DEBUG
+    /// Test-only: inject a ``ConnectionEvent`` into the ``connectionEvents``
+    /// stream. Used by tests to simulate failure paths before real producers
+    /// are wired in `StarClient` / `StarHost` / `StarTransport` (tracked as
+    /// follow-up tech debt).
+    public func testHook_injectConnectionEvent(_ event: ConnectionEvent) {
+        connectionEventsContinuation.yield(event)
+    }
+    #endif
 }

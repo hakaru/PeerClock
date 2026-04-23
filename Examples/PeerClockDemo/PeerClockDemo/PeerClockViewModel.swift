@@ -154,7 +154,7 @@ final class PeerClockViewModel {
 
         connectionTask = Task { [weak self] in
             guard let self, let clock = await self.clock else { return }
-            for await event in clock.connectionEvents {
+            for await event in clock.heartbeatEvents {
                 await self.handleConnection(event)
             }
         }
