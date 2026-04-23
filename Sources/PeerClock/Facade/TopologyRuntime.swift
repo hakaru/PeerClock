@@ -22,4 +22,9 @@ internal protocol TopologyRuntime: AnyObject, Sendable {
     /// Used by `AutoRuntime` to observe peer count without exposing
     /// transport internals.
     var currentPeerCount: Int { get async }
+
+    /// Stream of transition-ready events. `PeerClock` listens and rebuilds
+    /// services against the new transport when a transition fires. Mesh and
+    /// Star runtimes yield nothing; only `AutoRuntime` emits.
+    var transitionEvents: AsyncStream<TopologyTransition> { get }
 }

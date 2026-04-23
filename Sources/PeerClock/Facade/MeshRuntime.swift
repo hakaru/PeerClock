@@ -15,10 +15,12 @@ internal final class MeshRuntime: TopologyRuntime, @unchecked Sendable {
     let transport: any Transport
     let commandStream: AsyncStream<(PeerID, Command)>
     let connectionEvents: AsyncStream<ConnectionEvent>
+    let transitionEvents: AsyncStream<TopologyTransition>
 
     private let fanOut = PeerStreamFanOut<[Peer]>()
     private let commandContinuation: AsyncStream<(PeerID, Command)>.Continuation
     private let connectionEventsContinuation: AsyncStream<ConnectionEvent>.Continuation
+    private let transitionEventsContinuation: AsyncStream<TopologyTransition>.Continuation
 
     private let lock = NSLock()
     private var peerObserverTask: Task<Void, Never>?
@@ -36,6 +38,12 @@ internal final class MeshRuntime: TopologyRuntime, @unchecked Sendable {
         var ec: AsyncStream<ConnectionEvent>.Continuation!
         self.connectionEvents = AsyncStream { ec = $0 }
         self.connectionEventsContinuation = ec
+
+        // Mesh topology never triggers a topology transition; this stream
+        // exists purely to satisfy the TopologyRuntime protocol contract.
+        var te: AsyncStream<TopologyTransition>.Continuation!
+        self.transitionEvents = AsyncStream { te = $0 }
+        self.transitionEventsContinuation = te
     }
 
     func start() async throws {
@@ -81,6 +89,7 @@ internal final class MeshRuntime: TopologyRuntime, @unchecked Sendable {
         fanOut.finish()
         commandContinuation.finish()
         connectionEventsContinuation.finish()
+        transitionEventsContinuation.finish()
     }
 
     /// Subscribe to peer-set updates derived from `transport.peers`.

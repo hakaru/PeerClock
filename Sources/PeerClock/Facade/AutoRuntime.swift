@@ -23,6 +23,7 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
     let peerStream: AsyncStream<[Peer]>
     let commandStream: AsyncStream<(PeerID, Command)>
     let connectionEvents: AsyncStream<ConnectionEvent>
+    let transitionEvents: AsyncStream<TopologyTransition>
 
     private let localPeerID: PeerID
     private let heuristic: AutoHeuristic
@@ -39,6 +40,9 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
     private var peerContinuation: AsyncStream<[Peer]>.Continuation
     private var commandContinuation: AsyncStream<(PeerID, Command)>.Continuation
     private var connectionEventsContinuation: AsyncStream<ConnectionEvent>.Continuation
+    /// Will be used in Task 2.2 to emit `TopologyTransition.meshToStar` when
+    /// the settle window completes. Never yields in this task.
+    internal var transitionEventsContinuation: AsyncStream<TopologyTransition>.Continuation
 
     init(
         localPeerID: PeerID,
@@ -62,6 +66,12 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
         var ec: AsyncStream<ConnectionEvent>.Continuation!
         self.connectionEvents = AsyncStream { ec = $0 }
         self.connectionEventsContinuation = ec
+
+        // Never-yielding for now; Task 2.2 will wire this up to emit
+        // `TopologyTransition.meshToStar` when the settle window completes.
+        var te: AsyncStream<TopologyTransition>.Continuation!
+        self.transitionEvents = AsyncStream { te = $0 }
+        self.transitionEventsContinuation = te
     }
 
     var transport: any Transport {
@@ -110,6 +120,7 @@ internal final class AutoRuntime: TopologyRuntime, @unchecked Sendable {
         peerContinuation.finish()
         commandContinuation.finish()
         connectionEventsContinuation.finish()
+        transitionEventsContinuation.finish()
     }
 
     var currentPeerCount: Int {
