@@ -61,7 +61,7 @@ struct NTPSyncEngineTests {
         try await clientTransport.start()
 
         let responderTask = Task {
-            for await (sender, data) in coordinatorTransport.incomingMessages {
+            for await (_, data) in coordinatorTransport.incomingMessages {
                 let message = try MessageCodec.decode(data)
                 if case .ping(_, let t0) = message {
                     let response = Message.pong(
@@ -70,7 +70,7 @@ struct NTPSyncEngineTests {
                         t1: t0 + 1_000_000,
                         t2: t0 + 1_500_000
                     )
-                    try await coordinatorTransport.send(MessageCodec.encode(response), to: sender)
+                    try await coordinatorTransport.broadcast(MessageCodec.encode(response))
                 }
             }
         }
@@ -109,7 +109,7 @@ struct NTPSyncEngineTests {
         try await clientTransport.start()
 
         let responderTask = Task {
-            for await (sender, data) in coordinatorTransport.incomingMessages {
+            for await (_, data) in coordinatorTransport.incomingMessages {
                 let message = try MessageCodec.decode(data)
                 if case .ping(_, let t0) = message {
                     let response = Message.pong(
@@ -118,7 +118,7 @@ struct NTPSyncEngineTests {
                         t1: t0 + 1_000_000,
                         t2: t0 + 1_500_000
                     )
-                    try await coordinatorTransport.send(MessageCodec.encode(response), to: sender)
+                    try await coordinatorTransport.broadcast(MessageCodec.encode(response))
                 }
             }
         }

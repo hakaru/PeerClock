@@ -14,10 +14,11 @@ public protocol Transport: Sendable {
     /// Stream of incoming raw messages from peers.
     var incomingMessages: AsyncStream<(PeerID, Data)> { get }
 
-    /// Sends data reliably to a specific peer.
-    func send(_ data: Data, to peer: PeerID) async throws
-
     /// Broadcasts data reliably to all connected peers.
+    ///
+    /// Since v0.4.0 (Q5:B), transport-level unicast is removed. All reliable
+    /// delivery is broadcast; recipient filtering is an application / router
+    /// concern (see `CommandRouter` for commandID/logicalVersion dedup).
     func broadcast(_ data: Data) async throws
 
     /// Broadcasts data via the unreliable (UDP) channel.

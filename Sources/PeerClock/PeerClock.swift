@@ -15,12 +15,15 @@ public final class PeerClock: @unchecked Sendable {
     // MARK: - Public Static
 
     /// Library version string (SemVer).
-    public static let version = "0.2.0"
+    public static let version = "0.4.0"
 
     // MARK: - Public Properties
 
     /// Unique identifier for this peer, generated at init.
     public let localPeerID: PeerID
+
+    /// The configured topology for this instance.
+    public let topology: Topology
 
     // MARK: - Public Streams
 
@@ -29,6 +32,14 @@ public final class PeerClock: @unchecked Sendable {
 
     /// Stream of discovered peers on the local network.
     public let peers: AsyncStream<[Peer]>
+
+    /// Stream of observability events about connection lifecycle (star
+    /// handshake failures, timeouts, disconnects). Consumers use this for
+    /// analytics or UI. Events originate from the star transport's
+    /// failure paths (``StarClient`` / ``StarHost`` / ``StarTransport``).
+    ///
+    /// Emits only in star/auto topologies. Empty in pure mesh.
+    public let connectionEvents: AsyncStream<ConnectionEvent>
 
     /// Stream of incoming application commands from remote peers.
     public var commands: AsyncStream<(PeerID, Command)> {
@@ -108,6 +119,7 @@ public final class PeerClock: @unchecked Sendable {
     // MARK: - Private: Components
 
     private let lock = NSLock()
+    private var runtime: (any TopologyRuntime)?
     private var transport: (any Transport)?
     private var election: CoordinatorElection?
     private var syncEngine: NTPSyncEngine?
@@ -134,11 +146,13 @@ public final class PeerClock: @unchecked Sendable {
     private var statusPushRoutingTask: Task<Void, Never>?
     private var heartbeatElectionTask: Task<Void, Never>?
     private var driftJumpRoutingTask: Task<Void, Never>?
+    private var connectionEventsForwardTask: Task<Void, Never>?
 
     // MARK: - Private: Stream Continuations
 
     private let syncStateContinuation: AsyncStream<SyncState>.Continuation
     private let peersContinuation: AsyncStream<[Peer]>.Continuation
+    private let connectionEventsContinuation: AsyncStream<ConnectionEvent>.Continuation
 
     // MARK: - Private: State
 
@@ -147,30 +161,58 @@ public final class PeerClock: @unchecked Sendable {
 
     // MARK: - Init
 
-    /// Creates a new `PeerClock` instance.
+    /// Creates a new `PeerClock` instance with a chosen topology.
     ///
     /// - Parameters:
+    ///   - topology: Network topology. Default `.mesh` preserves v0.2.x wire compatibility.
     ///   - configuration: Runtime parameters. Defaults to ``Configuration/default``.
-    ///   - transportFactory: Optional factory for custom or mock transports.
-    ///     When `nil`, `WiFiTransport` is used.
     public init(
-        configuration: Configuration = .default,
-        transportFactory: (@Sendable (PeerID) -> any Transport)? = nil
+        topology: Topology = .mesh,
+        configuration: Configuration = .default
     ) {
         self.localPeerID = PeerID(UUID())
         self.configuration = configuration
-        self.transportFactory = transportFactory ?? { peerID in
+        self.topology = topology
+
+        // Transport factory derived from topology. Star/auto wiring lands in later Phase 2/4 tasks.
+        self.transportFactory = { peerID in
             WiFiTransport(localPeerID: peerID, configuration: configuration)
         }
 
         var syncStateCont: AsyncStream<SyncState>.Continuation!
         var peersCont: AsyncStream<[Peer]>.Continuation!
+        var connectionEventsCont: AsyncStream<ConnectionEvent>.Continuation!
 
         self.syncState = AsyncStream { syncStateCont = $0 }
         self.peers = AsyncStream { peersCont = $0 }
+        self.connectionEvents = AsyncStream { connectionEventsCont = $0 }
 
         self.syncStateContinuation = syncStateCont
         self.peersContinuation = peersCont
+        self.connectionEventsContinuation = connectionEventsCont
+    }
+
+    /// Testing-only init that injects a custom `Transport` factory. Topology is implicitly `.mesh`.
+    internal init(
+        configuration: Configuration = .default,
+        transportFactory: @escaping @Sendable (PeerID) -> any Transport
+    ) {
+        self.localPeerID = PeerID(UUID())
+        self.configuration = configuration
+        self.topology = .mesh
+        self.transportFactory = transportFactory
+
+        var syncStateCont: AsyncStream<SyncState>.Continuation!
+        var peersCont: AsyncStream<[Peer]>.Continuation!
+        var connectionEventsCont: AsyncStream<ConnectionEvent>.Continuation!
+
+        self.syncState = AsyncStream { syncStateCont = $0 }
+        self.peers = AsyncStream { peersCont = $0 }
+        self.connectionEvents = AsyncStream { connectionEventsCont = $0 }
+
+        self.syncStateContinuation = syncStateCont
+        self.peersContinuation = peersCont
+        self.connectionEventsContinuation = connectionEventsCont
     }
 
     // MARK: - Public API
@@ -179,8 +221,38 @@ public final class PeerClock: @unchecked Sendable {
     ///
     /// - Throws: Transport-level errors, such as denied network permission.
     public func start() async throws {
-        let tr: any Transport = lock.withLock {
+        // Select runtime based on topology. MeshRuntime owns the transport
+        // lifecycle; star/auto runtimes wire in Task 2.4 / 4.x.
+        let rt: any TopologyRuntime
+        switch topology {
+        case .mesh:
             let newTransport = transportFactory(localPeerID)
+            rt = MeshRuntime(transport: newTransport)
+        case .star(let role):
+            rt = StarRuntime(localPeerID: localPeerID, role: role, configuration: configuration)
+        case .auto(let heuristic):
+            rt = AutoRuntime(
+                localPeerID: localPeerID,
+                heuristic: heuristic,
+                configuration: configuration
+            )
+        }
+
+        lock.withLock { self.runtime = rt }
+        try await rt.start()
+
+        // Forward the topology runtime's observability events into the
+        // public `connectionEvents` stream. Runs until `stop()` cancels it.
+        let connEventsCont = self.connectionEventsContinuation
+        let eventsForwardTask = Task {
+            for await event in rt.connectionEvents {
+                connEventsCont.yield(event)
+            }
+        }
+        lock.withLock { self.connectionEventsForwardTask = eventsForwardTask }
+
+        let tr: any Transport = lock.withLock {
+            let newTransport = rt.transport
             self.transport = newTransport
 
             let elec = CoordinatorElection(localPeerID: localPeerID)
@@ -237,7 +309,7 @@ public final class PeerClock: @unchecked Sendable {
             self.heartbeatMonitor = heartbeat
         }
 
-        try await tr.start()
+        // Transport was started by `rt.start()` above — do not double-start.
 
         syncStateContinuation.yield(.discovering)
 
@@ -344,7 +416,7 @@ public final class PeerClock: @unchecked Sendable {
 
     /// Stops synchronization and disconnects from all peers.
     public func stop() async {
-        let (coordTask, syncResponder, fwdTask, hbTask, spTask, hbElecTask, djTask, eng, tr, registry, receiver, heartbeat, sched) = lock.withLock {
+        let (coordTask, syncResponder, fwdTask, hbTask, spTask, hbElecTask, djTask, ceTask, eng, rt, registry, receiver, heartbeat, sched) = lock.withLock {
             let c = coordinationTask; coordinationTask = nil
             let s = syncResponderTask; syncResponderTask = nil
             let f = syncStateForwardTask; syncStateForwardTask = nil
@@ -352,15 +424,17 @@ public final class PeerClock: @unchecked Sendable {
             let sp = statusPushRoutingTask; statusPushRoutingTask = nil
             let he = heartbeatElectionTask; heartbeatElectionTask = nil
             let dj = driftJumpRoutingTask; driftJumpRoutingTask = nil
+            let ce = connectionEventsForwardTask; connectionEventsForwardTask = nil
             let e = syncEngine
-            let t = transport
+            let r = runtime
             let reg = statusRegistry; statusRegistry = nil
             let rec = statusReceiver; statusReceiver = nil
             let hb = heartbeatMonitor; heartbeatMonitor = nil
             let sc = eventScheduler; eventScheduler = nil
-            return (c, s, f, h, sp, he, dj, e, t, reg, rec, hb, sc)
+            return (c, s, f, h, sp, he, dj, ce, e, r, reg, rec, hb, sc)
         }
 
+        // Cancel routing/coord tasks synchronously.
         coordTask?.cancel()
         syncResponder?.cancel()
         fwdTask?.cancel()
@@ -368,36 +442,62 @@ public final class PeerClock: @unchecked Sendable {
         spTask?.cancel()
         hbElecTask?.cancel()
         djTask?.cancel()
+        ceTask?.cancel()
 
-        await coordTask?.value
-        await syncResponder?.value
-        await fwdTask?.value
-        await hbTask?.value
-        await spTask?.value
-        await hbElecTask?.value
-        await djTask?.value
+        // Await task termination AND component/transport shutdown concurrently,
+        // so a hang in any single shutdown path does not hold transport
+        // teardown hostage. `rt?.stop()` tears down the transport; all other
+        // awaits are independent.
+        async let coordAwait: Void? = coordTask?.value
+        async let syncRespAwait: Void? = syncResponder?.value
+        async let fwdAwait: Void? = fwdTask?.value
+        async let hbAwait: Void? = hbTask?.value
+        async let spAwait: Void? = spTask?.value
+        async let hbElecAwait: Void? = hbElecTask?.value
+        async let djAwait: Void? = djTask?.value
+        async let ceAwait: Void? = ceTask?.value
+        async let engShutdown: Void? = eng?.stop()
+        async let registryShutdown: Void? = registry?.shutdown()
+        async let receiverShutdown: Void? = receiver?.shutdown()
+        async let heartbeatShutdown: Void? = heartbeat?.stop()
+        async let schedShutdown: Void? = sched?.shutdown()
+        // Transport shutdown is delegated to the topology runtime.
+        async let rtShutdown: Void? = rt?.stop()
 
-        await eng?.stop()
-        await registry?.shutdown()
-        await receiver?.shutdown()
-        await heartbeat?.stop()
-        await sched?.shutdown()
-        await tr?.stop()
+        _ = await (coordAwait, syncRespAwait, fwdAwait, hbAwait, spAwait, hbElecAwait, djAwait, ceAwait)
+        _ = await (engShutdown, registryShutdown, receiverShutdown, heartbeatShutdown, schedShutdown, rtShutdown)
 
         lock.withLock {
             self.lastSyncState = .idle
             self.lastSyncedAtNs = nil
+            self.transport = nil
+            self.runtime = nil
         }
         syncStateContinuation.yield(.idle)
     }
 
     /// Sends a command to a specific peer.
     ///
+    /// Since v0.4.0 transport-level unicast is removed (Q5:B). This method
+    /// broadcasts under the hood; the `to peer:` parameter is ignored at the
+    /// wire layer. Prefer ``broadcast(_:)`` with an application-level
+    /// recipient filter.
+    ///
     /// - Parameters:
     ///   - command: The command to send.
-    ///   - peer: Target peer identifier.
+    ///   - peer: Hint for the intended recipient (not enforced at transport).
+    @available(*, deprecated, message: "Transport-level unicast was removed in v0.4.0 (Q5:B). Use broadcast(_:) and filter recipients in the application payload.")
     public func send(_ command: Command, to peer: PeerID) async throws {
         guard let router = lock.withLock({ commandRouter }) else { return }
+        // Call through to the deprecated router.send to preserve current
+        // wire behaviour (commandUnicast type byte 0x11 retained for v0.2.x compat).
+        try await _withDeprecatedSend(router: router, command: command, peer: peer)
+    }
+
+    /// Internal shim so `send(_:to:)` can call the deprecated `CommandRouter.send`
+    /// without propagating a deprecation warning out of this file.
+    @available(*, deprecated)
+    private func _withDeprecatedSend(router: CommandRouter, command: Command, peer: PeerID) async throws {
         try await router.send(command, to: peer)
     }
 
@@ -450,7 +550,7 @@ public final class PeerClock: @unchecked Sendable {
     }
 
     /// Stream of heartbeat connection state transitions.
-    public var connectionEvents: AsyncStream<HeartbeatMonitor.Event> {
+    public var heartbeatEvents: AsyncStream<HeartbeatMonitor.Event> {
         lock.withLock { heartbeatMonitor }?.events ?? AsyncStream { $0.finish() }
     }
 
@@ -703,7 +803,7 @@ public final class PeerClock: @unchecked Sendable {
         guard let syncStream else { return }
         let task = Task { [weak self] in
             guard let self else { return }
-            for await (sender, message) in syncStream {
+            for await (_, message) in syncStream {
                 guard !Task.isCancelled else { break }
                 guard case .ping(_, let t0) = message else { continue }
 
@@ -711,10 +811,25 @@ public final class PeerClock: @unchecked Sendable {
                 let t2 = NTPSyncEngine.now()
                 let response = Message.pong(peerID: self.localPeerID, t0: t0, t1: t1, t2: t2)
                 let responseData = MessageCodec.encode(response)
-                try? await transport.send(responseData, to: sender)
+                // v0.4.0 (Q5:B): transport-level unicast removed. The requester's
+                // NTPSyncEngine filters pongs by `sender == coordinatorID`, so
+                // broadcasting is safe — non-coordinators' pongs are dropped.
+                try? await transport.broadcast(responseData)
             }
         }
 
         lock.withLock { syncResponderTask = task }
     }
+
+    // MARK: - Test Hooks (DEBUG)
+
+    #if DEBUG
+    /// Test-only: inject a ``ConnectionEvent`` into the ``connectionEvents``
+    /// stream. Used by tests to simulate failure paths before real producers
+    /// are wired in `StarClient` / `StarHost` / `StarTransport` (tracked as
+    /// follow-up tech debt).
+    public func testHook_injectConnectionEvent(_ event: ConnectionEvent) {
+        connectionEventsContinuation.yield(event)
+    }
+    #endif
 }

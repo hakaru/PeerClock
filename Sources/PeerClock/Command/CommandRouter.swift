@@ -61,6 +61,13 @@ public final class CommandRouter: CommandHandler, @unchecked Sendable {
         startListening()
     }
 
+    /// Sends a command addressed to a specific peer.
+    ///
+    /// Since v0.4.0, transport-level unicast is removed (Q5:B). The message is
+    /// broadcast; all peers receive it and `incomingCommands` delivers to each.
+    /// Consumers that need strict targeted delivery must filter by an
+    /// application-level recipient field inside the `Command` payload.
+    @available(*, deprecated, message: "Transport-level unicast was removed in v0.4.0 (Q5:B). Use broadcast(_:) and filter recipients in the application payload.")
     public func send(_ command: Command, to peer: PeerID) async throws {
         let (commandID, logicalVersion) = nextIdentity()
         let message = Message.commandUnicast(
@@ -69,7 +76,7 @@ public final class CommandRouter: CommandHandler, @unchecked Sendable {
             senderID: localPeerID,
             command: command
         )
-        try await transport.send(MessageCodec.encode(message), to: peer)
+        try await transport.broadcast(MessageCodec.encode(message))
     }
 
     public func broadcast(_ command: Command) async throws {

@@ -156,14 +156,6 @@ public final class FailoverTransport: Transport, @unchecked Sendable {
         logger.info("FailoverTransport stopped")
     }
 
-    public func send(_ data: Data, to peer: PeerID) async throws {
-        let transport = lock.withLock { active?.transport }
-        guard let transport else {
-            throw FailoverTransportError.notStarted
-        }
-        try await transport.send(data, to: peer)
-    }
-
     public func broadcast(_ data: Data) async throws {
         let transport = lock.withLock { active?.transport }
         guard let transport else {

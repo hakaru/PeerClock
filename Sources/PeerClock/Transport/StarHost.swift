@@ -1,0 +1,476 @@
+import Foundation
+import Network
+import os
+
+private let logger = Logger(subsystem: "net.hakaru.PeerClock", category: "StarHost")
+
+/// Host-side WebSocket server. Listens for client connections, performs
+/// HTTP upgrade, and manages per-client session state.
+public final class StarHost: @unchecked Sendable {
+
+    public struct ClientConnection: Sendable, Identifiable {
+        public let id: UUID
+        public let peerID: PeerID?
+    }
+
+    public let clients: AsyncStream<[ClientConnection]>
+    public let incomingMessages: AsyncStream<(clientID: UUID, data: Data)>
+
+    private let clientsContinuation: AsyncStream<[ClientConnection]>.Continuation
+    private let messagesContinuation: AsyncStream<(clientID: UUID, data: Data)>.Continuation
+
+    private var listener: NWListener?
+    private var sessions: [UUID: ClientSession] = [:]
+    private let lock = NSLock()
+    // Serial queue for NWListener callbacks (Lesson #1)
+    private let listenerQueue = DispatchQueue(label: "net.hakaru.PeerClock.StarHost.listener")
+
+    /// Task 12: 1Hz monitor to detect and disconnect slow clients
+    private var backpressureMonitor: Task<Void, Never>?
+
+    // Task 13: NWListener auto-restart state
+    private var restartCount = 0
+    private let maxRestarts = 3
+
+    /// Optional observer for handshake / connection-lifecycle events.
+    /// Wired from `StarTransport`. Each `ClientSession` invokes
+    /// `host?.onConnectionEvent?(...)` on failure.
+    internal var onConnectionEvent: (@Sendable (ConnectionEvent) -> Void)?
+
+    public init(onConnectionEvent: (@Sendable (ConnectionEvent) -> Void)? = nil) {
+        self.onConnectionEvent = onConnectionEvent
+
+        var cc: AsyncStream<[ClientConnection]>.Continuation!
+        self.clients = AsyncStream { cc = $0 }
+        self.clientsContinuation = cc
+
+        var mc: AsyncStream<(clientID: UUID, data: Data)>.Continuation!
+        self.incomingMessages = AsyncStream { mc = $0 }
+        self.messagesContinuation = mc
+    }
+
+    /// Start listening. Returns the NWListener (for BonjourAdvertiser attach).
+    @discardableResult
+    public func start() throws -> NWListener {
+        let params = NWParameters.tcp
+        params.includePeerToPeer = true
+        let l = try NWListener(using: params)
+
+        l.newConnectionHandler = { [weak self] conn in
+            self?.accept(conn)
+        }
+
+        // Task 13: Handle listener failure with auto-restart
+        l.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed(let error):
+                logger.error("[StarHost] listener failed: \(error.localizedDescription, privacy: .public)")
+                self?.scheduleListenerRestart()
+            case .cancelled:
+                logger.info("[StarHost] listener cancelled")
+            default:
+                logger.info("[StarHost] listener state=\(String(describing: state), privacy: .public)")
+            }
+        }
+
+        // Use serial listenerQueue, not .global (Lesson #1)
+        l.start(queue: listenerQueue)
+
+        lock.withLock { listener = l }
+
+        startBackpressureMonitor()
+
+        return l
+    }
+
+    public func stop() {
+        // Task 13: Reset restart counter on explicit stop
+        lock.withLock { restartCount = 0 }
+
+        backpressureMonitor?.cancel()
+        backpressureMonitor = nil
+
+        let l = lock.withLock { () -> NWListener? in
+            let captured = listener
+            listener = nil
+            return captured
+        }
+        l?.cancel()
+
+        // Snapshot sessions inside lock before iterating (Lesson #2)
+        let snapshot = lock.withLock { () -> [ClientSession] in
+            let all = Array(sessions.values)
+            sessions.removeAll()
+            return all
+        }
+        for session in snapshot {
+            session.cancelSendLoop()
+            session.connection.cancel()
+        }
+
+        // Yield empty list to notify consumers of full disconnect, then finish stream.
+        publishClients()
+
+        // Finish both streams on stop (Lesson #3)
+        clientsContinuation.finish()
+        messagesContinuation.finish()
+    }
+
+    /// Broadcast a binary payload to all clients with default (.control) priority.
+    public func broadcast(_ data: Data) {
+        Task { await self.broadcast(data, priority: .control) }
+    }
+
+    /// Broadcast a binary payload to all clients with explicit priority (Task 11).
+    public func broadcast(_ data: Data, priority: MessageDispatcher.Priority) async {
+        // Snapshot inside lock before iterating (Lesson #2)
+        let snapshot = lock.withLock { Array(sessions.values) }
+        for session in snapshot {
+            await session.enqueue(data, priority: priority)
+        }
+    }
+
+    /// Unicast to a specific client with default (.control) priority.
+    public func send(_ data: Data, to clientID: UUID) {
+        Task { await self.send(data, to: clientID, priority: .control) }
+    }
+
+    /// Unicast to a specific client with explicit priority (Task 11).
+    public func send(_ data: Data, to clientID: UUID, priority: MessageDispatcher.Priority) async {
+        // Snapshot inside lock (Lesson #2)
+        let session = lock.withLock { sessions[clientID] }
+        await session?.enqueue(data, priority: priority)
+    }
+
+    private func accept(_ connection: NWConnection) {
+        let sessionID = UUID()
+        let session = ClientSession(id: sessionID, connection: connection)
+        // Thread the event callback through so ClientSession can emit
+        // handshake failures / oversized-frame / invalidUpgrade events.
+        session.onConnectionEvent = { [weak self] event in
+            self?.onConnectionEvent?(event)
+        }
+
+        session.onHandshakeComplete = { [weak self] in
+            guard let self else { return }
+            self.publishClients()
+            session.startSendLoop()
+            session.startFrameLoop { [weak self] data in
+                self?.messagesContinuation.yield((clientID: sessionID, data: data))
+            } onClose: { [weak self] in
+                // Emit disconnected for graceful / I/O-driven close. Uses the
+                // assigned PeerID if the client had completed identity handshake.
+                if let peer = session.assignedPeerID {
+                    self?.onConnectionEvent?(ConnectionEvent(reason: .disconnected(peer: peer), peer: peer))
+                }
+                self?.removeSession(sessionID)
+            }
+        }
+
+        lock.withLock { sessions[sessionID] = session }
+        session.startHandshake(onConnectionLost: { [weak self] in
+            if let peer = session.assignedPeerID {
+                self?.onConnectionEvent?(ConnectionEvent(reason: .disconnected(peer: peer), peer: peer))
+            }
+            self?.removeSession(sessionID)
+        })
+    }
+
+    private func removeSession(_ id: UUID) {
+        let session = lock.withLock { sessions.removeValue(forKey: id) }
+        session?.cancelSendLoop()
+        publishClients()
+    }
+
+    private func publishClients() {
+        // Snapshot inside lock (Lesson #2)
+        let list = lock.withLock {
+            sessions.values.map { ClientConnection(id: $0.id, peerID: $0.assignedPeerID) }
+        }
+        clientsContinuation.yield(list)
+    }
+
+    /// Task 12: Monitor slow clients at 1Hz and disconnect them.
+    private func startBackpressureMonitor() {
+        backpressureMonitor = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard let self, !Task.isCancelled else { break }
+                let sessions = self.lock.withLock { Array(self.sessions.values) }
+                for session in sessions {
+                    if await session.dispatcher.isSlowClient() {
+                        logger.warning("[StarHost] slow client \(session.id) — disconnecting")
+                        session.connection.cancel()
+                        self.removeSession(session.id)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Listener auto-restart (Task 13)
+
+    private func scheduleListenerRestart() {
+        let current = lock.withLock { () -> Int in
+            restartCount += 1
+            return restartCount
+        }
+        guard current <= maxRestarts else {
+            logger.error("[StarHost] max listener restarts reached (\(self.maxRestarts)), giving up")
+            return
+        }
+        let backoff = min(30.0, pow(2.0, Double(current)))
+        logger.info("[StarHost] scheduling listener restart (attempt \(current)) in \(backoff, format: .fixed(precision: 1))s")
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(backoff))
+            guard let self else { return }
+            logger.info("[StarHost] restarting listener (attempt \(current))")
+            try? self.start()
+        }
+    }
+
+    // MARK: - Test-only accessors
+
+    #if DEBUG
+    internal var listenerForTest: NWListener? { lock.withLock { listener } }
+    #endif
+}
+
+// MARK: - ClientSession (private)
+
+final class ClientSession: @unchecked Sendable {
+    let id: UUID
+    let connection: NWConnection
+    var onHandshakeComplete: (() -> Void)?
+    /// Invoked on handshake failures / protocol violations to surface
+    /// observability events. Wired by `StarHost.accept(_:)`.
+    var onConnectionEvent: (@Sendable (ConnectionEvent) -> Void)?
+
+    // Thread-safe assignedPeerID — reads from any context, written on sessionQueue
+    private let stateLock = NSLock()
+    private var _assignedPeerID: PeerID?
+    var assignedPeerID: PeerID? { stateLock.withLock { _assignedPeerID } }
+
+    /// Task 11: Per-client priority dispatcher (unified Task 11+12 design)
+    let dispatcher = MessageDispatcher()
+
+    /// Task 11: Send loop task driven by the dispatcher
+    private var sendLoopTask: Task<Void, Never>?
+
+    private var buffer = Data()
+    private var onConnectionLost: (() -> Void)?
+    // Serial queue per session (Lesson #1) — includes id prefix for diagnostics (N-2)
+    private let sessionQueue: DispatchQueue
+
+    // Task 13: Handshake partial-read timeout (5s)
+    private var handshakeDeadline: DispatchWorkItem?
+
+    init(id: UUID, connection: NWConnection) {
+        self.id = id
+        self.connection = connection
+        self.sessionQueue = DispatchQueue(label: "net.hakaru.PeerClock.StarHost.session.\(id.uuidString.prefix(8))")
+    }
+
+    func setAssignedPeerID(_ peerID: PeerID) {
+        stateLock.withLock { _assignedPeerID = peerID }
+    }
+
+    /// Task 11: Enqueue data for prioritized send.
+    /// Wraps raw data in a WebSocket frame and delivers to dispatcher.
+    func enqueue(_ data: Data, priority: MessageDispatcher.Priority) async {
+        let frame = WebSocketFrame.encode(binary: data, masked: false)
+        await dispatcher.enqueue(.init(data: frame, priority: priority))
+    }
+
+    /// Task 11: Start the send loop after handshake completes.
+    /// Polls dispatcher and writes frames to the NWConnection.
+    func startSendLoop() {
+        sendLoopTask = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                if let msg = await self.dispatcher.dequeue() {
+                    await self.sendFrame(msg.data)
+                } else {
+                    try? await Task.sleep(for: .milliseconds(10))
+                }
+            }
+        }
+    }
+
+    func cancelSendLoop() {
+        sendLoopTask?.cancel()
+        sendLoopTask = nil
+    }
+
+    private func sendFrame(_ frame: Data) async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            connection.send(content: frame, completion: .contentProcessed { [weak self] error in
+                if let error, let self {
+                    logger.error("[ClientSession \(self.id)] send failed: \(error.localizedDescription, privacy: .public)")
+                }
+                cont.resume()
+            })
+        }
+    }
+
+    func startHandshake(onConnectionLost: @escaping () -> Void) {
+        self.onConnectionLost = onConnectionLost
+
+        // Task 13: Schedule 5s handshake deadline
+        let deadline = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            logger.error("[ClientSession \(self.id)] handshake timeout (5s)")
+            self.onConnectionEvent?(ConnectionEvent(reason: .timeout))
+            self.connection.cancel()
+        }
+        handshakeDeadline = deadline
+        sessionQueue.asyncAfter(deadline: .now() + 5.0, execute: deadline)
+
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                self?.receiveHandshakeRequest()
+            case .failed, .cancelled:
+                self?.handshakeDeadline?.cancel()
+                self?.handshakeDeadline = nil
+                self?.onConnectionLost?()
+            default:
+                break
+            }
+        }
+        // Use serial sessionQueue, not .global (Lesson #1)
+        connection.start(queue: sessionQueue)
+    }
+
+    private func receiveHandshakeRequest() {
+        func read() {
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, isComplete, error in
+                guard let self else { return }
+                if let error {
+                    logger.error("[ClientSession \(self.id)] handshake recv error: \(error.localizedDescription, privacy: .public)")
+                    self.connection.cancel()
+                    return  // stateUpdateHandler will fire onConnectionLost
+                }
+                if let data, !data.isEmpty {
+                    self.buffer.append(data)
+                    if let end = self.buffer.range(of: Data("\r\n\r\n".utf8)) {
+                        let requestHeaders = String(data: self.buffer[..<end.lowerBound], encoding: .utf8) ?? ""
+                        self.sendHandshakeResponse(request: requestHeaders)
+                        self.buffer.removeSubrange(..<end.upperBound)
+                    } else if self.buffer.count > 16_384 {
+                        // N-1: cap buffer size to prevent memory exhaustion
+                        logger.warning("[ClientSession \(self.id)] handshake buffer overflow")
+                        self.onConnectionEvent?(ConnectionEvent(reason: .handshakeFailed(.oversizedFrame)))
+                        self.connection.cancel()
+                        return
+                    } else {
+                        read()
+                    }
+                } else if isComplete {
+                    self.connection.cancel()
+                    return
+                }
+            }
+        }
+        read()
+    }
+
+    private func sendHandshakeResponse(request: String) {
+        guard let key = WebSocketHandshake.extractKey(from: request) else {
+            onConnectionEvent?(ConnectionEvent(reason: .handshakeFailed(.invalidUpgrade)))
+            sendHandshakeError(reason: "missing Sec-WebSocket-Key")
+            return
+        }
+        let accept = WebSocketHandshake.computeAccept(clientKey: key)
+        let response = """
+        HTTP/1.1 101 Switching Protocols\r
+        Upgrade: websocket\r
+        Connection: Upgrade\r
+        Sec-WebSocket-Accept: \(accept)\r
+        \r
+
+        """
+        connection.send(content: Data(response.utf8), completion: .contentProcessed { [weak self] _ in
+            // Task 13: Cancel handshake deadline on successful completion
+            self?.handshakeDeadline?.cancel()
+            self?.handshakeDeadline = nil
+            self?.onHandshakeComplete?()
+        })
+    }
+
+    private func sendHandshakeError(reason: String) {
+        let response = "HTTP/1.1 400 Bad Request\r\n\r\n\(reason)"
+        connection.send(content: Data(response.utf8), completion: .contentProcessed { [weak self] _ in
+            self?.connection.cancel()
+        })
+    }
+
+    func startFrameLoop(onData: @escaping (Data) -> Void, onClose: @escaping () -> Void) {
+        // I-4: Use closure-based pattern so [weak self] avoids retain cycle
+        var loop: (() -> Void)!
+        loop = { [weak self] in
+            guard let self else { return }
+            // DoS guard: cap buffer at 2 MiB (one max in-flight frame + next chunk)
+            let maxBufferSize = 2 * 1_048_576
+            if self.buffer.count > maxBufferSize {
+                logger.error("[ClientSession \(self.id)] buffer overflow (\(self.buffer.count) bytes) — closing connection")
+                self.onConnectionEvent?(ConnectionEvent(reason: .handshakeFailed(.oversizedFrame)))
+                self.onConnectionLost = nil
+                self.connection.stateUpdateHandler = nil
+                self.connection.cancel()
+                onClose()
+                return
+            }
+            while true {
+                do {
+                    guard let (frame, consumed) = try WebSocketFrame.decode(self.buffer) else { break }
+                    self.buffer.removeFirst(consumed)
+                    switch frame {
+                    case .binary(let d):
+                        onData(d)
+                    case .text(let s):
+                        onData(Data(s.utf8))
+                    case .close:
+                        // C-3: Disable onConnectionLost before cancel to prevent double removeSession
+                        self.onConnectionLost = nil
+                        self.connection.stateUpdateHandler = nil
+                        self.connection.cancel()
+                        onClose()
+                        return
+                    case .ping(let p):
+                        // Server uses encodePong (opcode 0xA), unmasked (Lesson #4)
+                        let pong = WebSocketFrame.encodePong(p, masked: false)
+                        self.connection.send(content: pong, completion: .idempotent)
+                    case .pong:
+                        break
+                    }
+                } catch {
+                    logger.error("[ClientSession \(self.id)] frame decode error: \(error.localizedDescription, privacy: .public)")
+                    self.onConnectionLost = nil
+                    self.connection.stateUpdateHandler = nil
+                    self.connection.cancel()
+                    onClose()
+                    return
+                }
+            }
+            self.connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, _, _ in
+                guard let self, let data, !data.isEmpty else {
+                    onClose()
+                    return
+                }
+                self.buffer.append(data)
+                loop()
+            }
+        }
+        loop()
+    }
+
+    /// Legacy direct send — kept for ping/pong responses inside frame loop.
+    /// External callers should use enqueue(_:priority:) instead.
+    func send(_ frame: Data) {
+        connection.send(content: frame, completion: .contentProcessed { [weak self] error in
+            if let error, let self {
+                logger.error("[ClientSession \(self.id)] send failed: \(error.localizedDescription, privacy: .public)")
+            }
+        })
+    }
+}

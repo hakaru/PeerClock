@@ -68,11 +68,11 @@ struct FailoverTransportTests {
         #expect(failover.activeLabel == nil)
     }
 
-    @Test("send throws notStarted before start")
+    @Test("broadcast throws notStarted before start")
     func sendBeforeStartThrows() async throws {
         let failover = FailoverTransport(options: [])
         do {
-            try await failover.send(Data(), to: PeerID(rawValue: UUID()))
+            try await failover.broadcast(Data())
             Issue.record("Expected throw")
         } catch FailoverTransportError.notStarted {
             // ok

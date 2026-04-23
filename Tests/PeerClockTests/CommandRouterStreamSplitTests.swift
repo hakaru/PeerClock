@@ -32,7 +32,7 @@ struct CommandRouterStreamSplitTests {
             }
         }
 
-        try await senderTransport.send(MessageCodec.encode(.ping(peerID: senderID, t0: 123)), to: peerID)
+        try await senderTransport.broadcast(MessageCodec.encode(.ping(peerID: senderID, t0: 123)))
         try await Task.sleep(for: .milliseconds(100))
         requestTask.cancel()
         responseTask.cancel()
@@ -68,7 +68,7 @@ struct CommandRouterStreamSplitTests {
             }
         }
 
-        try await senderTransport.send(MessageCodec.encode(.pong(peerID: senderID, t0: 1, t1: 2, t2: 3)), to: peerID)
+        try await senderTransport.broadcast(MessageCodec.encode(.pong(peerID: senderID, t0: 1, t1: 2, t2: 3)))
         try await Task.sleep(for: .milliseconds(100))
         requestTask.cancel()
         responseTask.cancel()
@@ -108,8 +108,8 @@ struct CommandRouterStreamSplitTests {
             senderID: senderID,
             command: Command(type: "cmd")
         )
-        try await senderTransport.send(MessageCodec.encode(command), to: peerID)
-        try await senderTransport.send(MessageCodec.encode(.heartbeat), to: peerID)
+        try await senderTransport.broadcast(MessageCodec.encode(command))
+        try await senderTransport.broadcast(MessageCodec.encode(.heartbeat))
         try await Task.sleep(for: .milliseconds(100))
         requestTask.cancel()
         responseTask.cancel()

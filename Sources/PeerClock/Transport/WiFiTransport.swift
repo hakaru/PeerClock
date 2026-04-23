@@ -80,7 +80,17 @@ public final class WiFiTransport: Transport, @unchecked Sendable {
         incomingMessagesContinuation.finish()
     }
 
-    public func send(_ data: Data, to peer: PeerID) async throws {
+    public func broadcast(_ data: Data) async throws {
+        let peers = lock.withLock { Array(peerSnapshots) }
+        for peer in peers {
+            try await sendToConnection(data, peer: peer)
+        }
+    }
+
+    /// Per-connection reliable send. Private — since v0.4.0 (Q5:B) the public
+    /// Transport protocol exposes only `broadcast`; this helper exists solely
+    /// so `broadcast` can fan out over the connection table.
+    private func sendToConnection(_ data: Data, peer: PeerID) async throws {
         guard let connection = lock.withLock({ connections[peer] }) else {
             return
         }
@@ -94,13 +104,6 @@ public final class WiFiTransport: Transport, @unchecked Sendable {
                     continuation.resume()
                 }
             })
-        }
-    }
-
-    public func broadcast(_ data: Data) async throws {
-        let peers = lock.withLock { Array(peerSnapshots) }
-        for peer in peers {
-            try await send(data, to: peer)
         }
     }
 

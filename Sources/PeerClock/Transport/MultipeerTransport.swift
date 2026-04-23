@@ -70,14 +70,6 @@ public final class MultipeerTransport: NSObject, Transport, @unchecked Sendable 
         logger.info("MultipeerTransport stopped")
     }
 
-    public func send(_ data: Data, to peer: PeerID) async throws {
-        let (session, mcPeer) = lock.withLock { (self.session, self.pcToMC[peer]) }
-        guard let session, let mcPeer, session.connectedPeers.contains(mcPeer) else {
-            throw MultipeerTransportError.notConnected
-        }
-        try session.send(data, toPeers: [mcPeer], with: .reliable)
-    }
-
     public func broadcast(_ data: Data) async throws {
         let (session, connected) = lock.withLock { (self.session, self.session?.connectedPeers ?? []) }
         guard let session, !connected.isEmpty else { return }

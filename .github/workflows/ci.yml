@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, 'feat/**' ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-test:
+    name: Build & test
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift version
+        run: swift --version
+      - name: Build
+        run: swift build
+      - name: Test
+        run: swift test
+
+  wire-compat:
+    name: Mesh wire-compat
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run wire-compat golden tests
+        run: swift test --filter WireCompatGoldenTests
+
+  topology-matrix:
+    name: Topology suite (${{ matrix.suite }})
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - TopologyTests
+          - TopologyFacadeTests
+          - StarRuntimeTests
+          - AutoTopologyTransitionTests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run ${{ matrix.suite }}
+        run: swift test --filter ${{ matrix.suite }}
