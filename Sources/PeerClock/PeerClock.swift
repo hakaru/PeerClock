@@ -166,6 +166,14 @@ public final class PeerClock: @unchecked Sendable {
     /// needlessly tear down and rebuild the service layer. Gated under `lock`.
     private var isTransitioning: Bool = false
 
+    /// Set by `stop()` so that an in-flight `handleTransition` cannot
+    /// restart services on top of the shutdown. `stop()` waits until
+    /// `isTransitioning` is false before proceeding with teardown, and
+    /// `performMeshToStarTransition` bails before the service rebuild when
+    /// it observes `isStopped`. Reset in `start()` for restart-after-stop.
+    /// Gated under `lock`.
+    private var isStopped: Bool = false
+
     // MARK: - Init
 
     /// Creates a new `PeerClock` instance with a chosen topology.
@@ -228,6 +236,9 @@ public final class PeerClock: @unchecked Sendable {
     ///
     /// - Throws: Transport-level errors, such as denied network permission.
     public func start() async throws {
+        // Reset shutdown state so restart-after-stop works.
+        lock.withLock { self.isStopped = false }
+
         // Select runtime based on topology. MeshRuntime owns the transport
         // lifecycle; star/auto runtimes wire in Task 2.4 / 4.x.
         let rt: any TopologyRuntime
@@ -254,7 +265,22 @@ public final class PeerClock: @unchecked Sendable {
     }
 
     /// Stops synchronization and disconnects from all peers.
+    ///
+    /// Serialized against in-flight auto-topology transitions: if a
+    /// `handleTransition` is processing a `TopologyTransition.meshToStar`
+    /// event when `stop()` is invoked, the shutdown waits for that
+    /// transition to finish its own bail-out check (see
+    /// `performMeshToStarTransition`) before tearing down services, so
+    /// the transition cannot rebuild services on top of teardown.
     public func stop() async {
+        // Signal shutdown first, then wait for any in-flight transition.
+        lock.withLock { self.isStopped = true }
+        while lock.withLock({ self.isTransitioning }) {
+            // Poll; `handleTransition` only runs for a bounded window and
+            // its body checks `isStopped` before doing the service rebuild.
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+
         await teardownServices()
 
         let rt = lock.withLock { () -> (any TopologyRuntime)? in
@@ -555,14 +581,18 @@ public final class PeerClock: @unchecked Sendable {
     /// Guarded against re-entrancy: if a previous transition is in flight
     /// (or a subsequent duplicate event arrives after `restartServices`
     /// re-subscribes), the second call is dropped.
+    ///
+    /// Also guarded against shutdown: if `stop()` has set `isStopped`,
+    /// the event is dropped without any state mutation.
     private func handleTransition(_ event: TopologyTransition) async {
         let shouldProceed = lock.withLock { () -> Bool in
+            if isStopped { return false }
             if isTransitioning { return false }
             isTransitioning = true
             return true
         }
         guard shouldProceed else {
-            pcLogger.info("[Transition] drop duplicate/overlapping event \(String(describing: event.kind), privacy: .public)")
+            pcLogger.info("[Transition] drop event \(String(describing: event.kind), privacy: .public)")
             return
         }
         defer { lock.withLock { isTransitioning = false } }
@@ -590,6 +620,14 @@ public final class PeerClock: @unchecked Sendable {
         }
         // performTransition() swapped the inner runtime. The old transport is
         // gone; the new transport is now reachable via runtime.transport.
+        //
+        // Before rebuilding services, re-check shutdown: stop() may have been
+        // called mid-transition. If so, leave the rebuild to no one — stop()
+        // will tear down `runtime` directly and services stay nil.
+        guard !lock.withLock({ self.isStopped }) else {
+            pcLogger.info("[Transition] stopped during swap — skipping service rebuild")
+            return
+        }
         guard let newTransport = lock.withLock({ self.runtime?.transport }) else {
             pcLogger.error("[Transition] runtime.transport is nil after swap — cannot rebuild services")
             return
@@ -966,11 +1004,16 @@ public final class PeerClock: @unchecked Sendable {
     public private(set) var testHook_restartCount: Int = 0
 
     /// Test-only: inject a mesh → star transition on a running `.auto`
-    /// `PeerClock`. Awaits the full orchestration (`performTransition` +
-    /// `restartServices`) so callers can make assertions about post-swap state
-    /// without racing. Requires the instance to already be started on `.auto`.
+    /// `PeerClock`. Awaits the full orchestration (`handleTransition` +
+    /// `performTransition` + `restartServices`) so callers can make assertions
+    /// about post-swap state without racing. Requires the instance to already
+    /// be started on `.auto`.
+    ///
+    /// Goes through `handleTransition` rather than `performMeshToStarTransition`
+    /// directly so the `isStopped` / `isTransitioning` guards are exercised — a
+    /// concurrent `stop()` sees the same serialization tests do.
     public func testHook_forceMeshToStarTransition() async {
-        await performMeshToStarTransition()
+        await handleTransition(TopologyTransition(kind: .meshToStar))
     }
 
     /// Test-only: inject a fake peer count through the active `AutoRuntime`'s
