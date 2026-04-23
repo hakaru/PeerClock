@@ -424,6 +424,7 @@ public final class PeerClock: @unchecked Sendable {
             return (c, s, f, h, sp, he, dj, e, r, reg, rec, hb, sc)
         }
 
+        // Cancel routing/coord tasks synchronously.
         coordTask?.cancel()
         syncResponder?.cancel()
         fwdTask?.cancel()
@@ -432,21 +433,27 @@ public final class PeerClock: @unchecked Sendable {
         hbElecTask?.cancel()
         djTask?.cancel()
 
-        await coordTask?.value
-        await syncResponder?.value
-        await fwdTask?.value
-        await hbTask?.value
-        await spTask?.value
-        await hbElecTask?.value
-        await djTask?.value
-
-        await eng?.stop()
-        await registry?.shutdown()
-        await receiver?.shutdown()
-        await heartbeat?.stop()
-        await sched?.shutdown()
+        // Await task termination AND component/transport shutdown concurrently,
+        // so a hang in any single shutdown path does not hold transport
+        // teardown hostage. `rt?.stop()` tears down the transport; all other
+        // awaits are independent.
+        async let coordAwait: Void? = coordTask?.value
+        async let syncRespAwait: Void? = syncResponder?.value
+        async let fwdAwait: Void? = fwdTask?.value
+        async let hbAwait: Void? = hbTask?.value
+        async let spAwait: Void? = spTask?.value
+        async let hbElecAwait: Void? = hbElecTask?.value
+        async let djAwait: Void? = djTask?.value
+        async let engShutdown: Void? = eng?.stop()
+        async let registryShutdown: Void? = registry?.shutdown()
+        async let receiverShutdown: Void? = receiver?.shutdown()
+        async let heartbeatShutdown: Void? = heartbeat?.stop()
+        async let schedShutdown: Void? = sched?.shutdown()
         // Transport shutdown is delegated to the topology runtime.
-        await rt?.stop()
+        async let rtShutdown: Void? = rt?.stop()
+
+        _ = await (coordAwait, syncRespAwait, fwdAwait, hbAwait, spAwait, hbElecAwait, djAwait)
+        _ = await (engShutdown, registryShutdown, receiverShutdown, heartbeatShutdown, schedShutdown, rtShutdown)
 
         lock.withLock {
             self.lastSyncState = .idle
