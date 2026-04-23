@@ -26,6 +26,7 @@ internal final class StarRuntime: TopologyRuntime, @unchecked Sendable {
     let peerStream: AsyncStream<[Peer]>
     let commandStream: AsyncStream<(PeerID, Command)>
     let connectionEvents: AsyncStream<ConnectionEvent>
+    let transitionEvents: AsyncStream<TopologyTransition>
 
     private let localPeerID: PeerID
     private let role: StarRole
@@ -38,6 +39,7 @@ internal final class StarRuntime: TopologyRuntime, @unchecked Sendable {
     private let peerContinuation: AsyncStream<[Peer]>.Continuation
     private let commandContinuation: AsyncStream<(PeerID, Command)>.Continuation
     private let connectionEventsContinuation: AsyncStream<ConnectionEvent>.Continuation
+    private let transitionEventsContinuation: AsyncStream<TopologyTransition>.Continuation
     private var connectionEventForwardTask: Task<Void, Never>?
 
     init(localPeerID: PeerID, role: StarRole, configuration: Configuration) {
@@ -73,6 +75,12 @@ internal final class StarRuntime: TopologyRuntime, @unchecked Sendable {
         var ec: AsyncStream<ConnectionEvent>.Continuation!
         self.connectionEvents = AsyncStream { ec = $0 }
         self.connectionEventsContinuation = ec
+
+        // Star topology never triggers a topology transition; this stream
+        // exists purely to satisfy the TopologyRuntime protocol contract.
+        var te: AsyncStream<TopologyTransition>.Continuation!
+        self.transitionEvents = AsyncStream { te = $0 }
+        self.transitionEventsContinuation = te
     }
 
     func start() async throws {
@@ -141,6 +149,7 @@ internal final class StarRuntime: TopologyRuntime, @unchecked Sendable {
         peerContinuation.finish()
         commandContinuation.finish()
         connectionEventsContinuation.finish()
+        transitionEventsContinuation.finish()
     }
 
     /// Placeholder — always `0` in Phase 2. See type-level doc comment.

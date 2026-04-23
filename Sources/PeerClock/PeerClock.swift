@@ -15,7 +15,7 @@ public final class PeerClock: @unchecked Sendable {
     // MARK: - Public Static
 
     /// Library version string (SemVer).
-    public static let version = "0.4.0"
+    public static let version = "0.4.1"
 
     // MARK: - Public Properties
 
@@ -147,6 +147,7 @@ public final class PeerClock: @unchecked Sendable {
     private var heartbeatElectionTask: Task<Void, Never>?
     private var driftJumpRoutingTask: Task<Void, Never>?
     private var connectionEventsForwardTask: Task<Void, Never>?
+    private var transitionEventsSubscriberTask: Task<Void, Never>?
 
     // MARK: - Private: Stream Continuations
 
@@ -158,6 +159,12 @@ public final class PeerClock: @unchecked Sendable {
 
     private var knownPeers: Set<PeerID> = []
     private var currentCoordinator: PeerID?
+
+    /// Re-entrancy guard for `handleTransition`. `AutoRuntime` currently only
+    /// emits `.meshToStar` once (no reverse), but `restartServices` re-subscribes
+    /// to `runtime.transitionEvents` and a mis-fired duplicate event would
+    /// needlessly tear down and rebuild the service layer. Gated under `lock`.
+    private var isTransitioning: Bool = false
 
     // MARK: - Init
 
@@ -241,28 +248,73 @@ public final class PeerClock: @unchecked Sendable {
         lock.withLock { self.runtime = rt }
         try await rt.start()
 
-        // Forward the topology runtime's observability events into the
-        // public `connectionEvents` stream. Runs until `stop()` cancels it.
+        let tr = rt.transport
+        lock.withLock { self.transport = tr }
+        await restartServices(transport: tr)
+    }
+
+    /// Stops synchronization and disconnects from all peers.
+    public func stop() async {
+        await teardownServices()
+
+        let rt = lock.withLock { () -> (any TopologyRuntime)? in
+            let r = runtime
+            runtime = nil
+            transport = nil
+            return r
+        }
+        await rt?.stop()
+
+        lock.withLock {
+            self.lastSyncState = .idle
+            self.lastSyncedAtNs = nil
+        }
+        syncStateContinuation.yield(.idle)
+    }
+
+    // MARK: - Private: Service Lifecycle
+
+    /// Build (or rebuild) the downstream services layer against the given transport.
+    ///
+    /// On a fresh `start()`, existing service state is `nil`, so this is a
+    /// pure build. On auto-topology hot-swap (Task 3.2), service state already
+    /// exists — the method tears it down first, then rebuilds against the new
+    /// transport.
+    ///
+    /// Requires `self.runtime` to already be set and started (transport live).
+    private func restartServices(transport: any Transport) async {
+        #if DEBUG
+        lock.withLock { testHook_restartCount += 1 }
+        #endif
+        // 1. Tear down any previously wired services. Safe to call unconditionally
+        //    — a fresh start has nothing to tear down and this is a no-op.
+        await teardownServices()
+
+        // 2. Subscribe to the current runtime's connectionEvents. We resubscribe
+        //    on every swap so post-swap handshake failures surface on
+        //    `PeerClock.connectionEvents`.
+        let rt = lock.withLock { self.runtime }
         let connEventsCont = self.connectionEventsContinuation
-        let eventsForwardTask = Task {
-            for await event in rt.connectionEvents {
-                connEventsCont.yield(event)
+        let eventsForwardTask: Task<Void, Never>? = rt.map { runtime in
+            Task {
+                for await event in runtime.connectionEvents {
+                    connEventsCont.yield(event)
+                }
             }
         }
-        lock.withLock { self.connectionEventsForwardTask = eventsForwardTask }
 
-        let tr: any Transport = lock.withLock {
-            let newTransport = rt.transport
-            self.transport = newTransport
+        // 3. Rebuild services against `transport`.
+        lock.withLock {
+            self.transport = transport
 
             let elec = CoordinatorElection(localPeerID: localPeerID)
             self.election = elec
 
-            let router = CommandRouter(transport: newTransport, localPeerID: localPeerID)
+            let router = CommandRouter(transport: transport, localPeerID: localPeerID)
             self.commandRouter = router
 
             let eng = NTPSyncEngine(
-                transport: newTransport,
+                transport: transport,
                 localPeerID: localPeerID,
                 configuration: configuration,
                 syncResponseStream: router.syncResponses
@@ -281,10 +333,10 @@ public final class PeerClock: @unchecked Sendable {
             // 自分自身は最初から既知ピアに含める
             knownPeers = [localPeerID]
 
-            return newTransport
+            self.connectionEventsForwardTask = eventsForwardTask
         }
 
-        // Status / Heartbeat actors を構築（self を weak キャプチャして transport を参照）
+        // 4. Status / Heartbeat actors を構築（self を weak キャプチャして transport を参照）
         let registry = StatusRegistry(
             localPeerID: localPeerID,
             debounce: configuration.statusSendDebounce
@@ -309,7 +361,7 @@ public final class PeerClock: @unchecked Sendable {
             self.heartbeatMonitor = heartbeat
         }
 
-        // Transport was started by `rt.start()` above — do not double-start.
+        // Transport was started by the runtime — do not double-start.
 
         syncStateContinuation.yield(.discovering)
 
@@ -406,17 +458,45 @@ public final class PeerClock: @unchecked Sendable {
         }()
         try? await registry.setStatus(deviceName, forKey: StatusKeys.deviceName)
 
-        // メイン協調タスクを開始
+        // メイン協調タスクを開始。
+        // Peer 更新は Transport ではなく TopologyRuntime の `peerStream` から
+        // 受け取る。MeshRuntime は `transport.peers` を fan-out し複数サブスクラ
+        // イバに配信するため、このループと他の観測者 (AutoRuntime 等) が
+        // single-consumer 争奪で饑餓化することはない。
+        let peersStream: AsyncStream<[Peer]> = lock.withLock { self.runtime }?.peerStream
+            ?? AsyncStream { $0.finish() }
         let coordTask = Task { [weak self] in
             guard let self else { return }
-            await self.runCoordinationLoop(transport: tr)
+            await self.runCoordinationLoop(peerStream: peersStream)
         }
         lock.withLock { self.coordinationTask = coordTask }
+
+        // Subscribe to runtime transition events. Auto topology emits
+        // meshToStar once its peer-count threshold settles; we orchestrate
+        // the physical swap here. Mesh/Star runtimes yield nothing, so the
+        // subscriber idles.
+        let runtimeRef = lock.withLock { self.runtime }
+        if let runtimeRef {
+            let transitionStream = runtimeRef.transitionEvents
+            let transitionTask = Task { [weak self] in
+                for await event in transitionStream {
+                    if Task.isCancelled { break }
+                    await self?.handleTransition(event)
+                }
+            }
+            lock.withLock { self.transitionEventsSubscriberTask = transitionTask }
+        }
     }
 
-    /// Stops synchronization and disconnects from all peers.
-    public func stop() async {
-        let (coordTask, syncResponder, fwdTask, hbTask, spTask, hbElecTask, djTask, ceTask, eng, rt, registry, receiver, heartbeat, sched) = lock.withLock {
+    /// Cancel and await service-layer tasks and components.
+    ///
+    /// Does NOT touch `runtime` or `transport` — that's the caller's
+    /// responsibility. Shared by `stop()` and `restartServices(transport:)`
+    /// (hot-swap). Mirrors the parallelized cancel/await pattern: cancel all
+    /// tasks synchronously, then await task termination + component shutdown
+    /// concurrently via `async let`.
+    private func teardownServices() async {
+        let (coordTask, syncResponder, fwdTask, hbTask, spTask, hbElecTask, djTask, ceTask, trans, eng, registry, receiver, heartbeat, sched) = lock.withLock {
             let c = coordinationTask; coordinationTask = nil
             let s = syncResponderTask; syncResponderTask = nil
             let f = syncStateForwardTask; syncStateForwardTask = nil
@@ -425,13 +505,16 @@ public final class PeerClock: @unchecked Sendable {
             let he = heartbeatElectionTask; heartbeatElectionTask = nil
             let dj = driftJumpRoutingTask; driftJumpRoutingTask = nil
             let ce = connectionEventsForwardTask; connectionEventsForwardTask = nil
-            let e = syncEngine
-            let r = runtime
+            let tr = transitionEventsSubscriberTask; transitionEventsSubscriberTask = nil
+            let e = syncEngine; syncEngine = nil
             let reg = statusRegistry; statusRegistry = nil
             let rec = statusReceiver; statusReceiver = nil
             let hb = heartbeatMonitor; heartbeatMonitor = nil
             let sc = eventScheduler; eventScheduler = nil
-            return (c, s, f, h, sp, he, dj, ce, e, r, reg, rec, hb, sc)
+            election = nil
+            commandRouter = nil
+            driftMonitor = nil
+            return (c, s, f, h, sp, he, dj, ce, tr, e, reg, rec, hb, sc)
         }
 
         // Cancel routing/coord tasks synchronously.
@@ -443,11 +526,10 @@ public final class PeerClock: @unchecked Sendable {
         hbElecTask?.cancel()
         djTask?.cancel()
         ceTask?.cancel()
+        trans?.cancel()
 
-        // Await task termination AND component/transport shutdown concurrently,
-        // so a hang in any single shutdown path does not hold transport
-        // teardown hostage. `rt?.stop()` tears down the transport; all other
-        // awaits are independent.
+        // Await task termination AND component shutdown concurrently, so a
+        // hang in any single shutdown path does not hold the rest hostage.
         async let coordAwait: Void? = coordTask?.value
         async let syncRespAwait: Void? = syncResponder?.value
         async let fwdAwait: Void? = fwdTask?.value
@@ -456,24 +538,66 @@ public final class PeerClock: @unchecked Sendable {
         async let hbElecAwait: Void? = hbElecTask?.value
         async let djAwait: Void? = djTask?.value
         async let ceAwait: Void? = ceTask?.value
+        async let transAwait: Void? = trans?.value
         async let engShutdown: Void? = eng?.stop()
         async let registryShutdown: Void? = registry?.shutdown()
         async let receiverShutdown: Void? = receiver?.shutdown()
         async let heartbeatShutdown: Void? = heartbeat?.stop()
         async let schedShutdown: Void? = sched?.shutdown()
-        // Transport shutdown is delegated to the topology runtime.
-        async let rtShutdown: Void? = rt?.stop()
 
-        _ = await (coordAwait, syncRespAwait, fwdAwait, hbAwait, spAwait, hbElecAwait, djAwait, ceAwait)
-        _ = await (engShutdown, registryShutdown, receiverShutdown, heartbeatShutdown, schedShutdown, rtShutdown)
+        _ = await (coordAwait, syncRespAwait, fwdAwait, hbAwait, spAwait, hbElecAwait, djAwait, ceAwait, transAwait)
+        _ = await (engShutdown, registryShutdown, receiverShutdown, heartbeatShutdown, schedShutdown)
+    }
 
-        lock.withLock {
-            self.lastSyncState = .idle
-            self.lastSyncedAtNs = nil
-            self.transport = nil
-            self.runtime = nil
+    // MARK: - Private: Topology Transition Handling
+
+    /// Dispatches transition events emitted by `runtime.transitionEvents`.
+    ///
+    /// Guarded against re-entrancy: if a previous transition is in flight
+    /// (or a subsequent duplicate event arrives after `restartServices`
+    /// re-subscribes), the second call is dropped.
+    private func handleTransition(_ event: TopologyTransition) async {
+        let shouldProceed = lock.withLock { () -> Bool in
+            if isTransitioning { return false }
+            isTransitioning = true
+            return true
         }
-        syncStateContinuation.yield(.idle)
+        guard shouldProceed else {
+            pcLogger.info("[Transition] drop duplicate/overlapping event \(String(describing: event.kind), privacy: .public)")
+            return
+        }
+        defer { lock.withLock { isTransitioning = false } }
+
+        switch event.kind {
+        case .meshToStar:
+            await performMeshToStarTransition()
+        }
+    }
+
+    /// Orchestrate the mesh → star hot-swap: drive `AutoRuntime.performTransition()`
+    /// to swap the inner runtime, then rebuild the service layer against the
+    /// freshly-started star transport.
+    private func performMeshToStarTransition() async {
+        guard let auto = lock.withLock({ runtime as? AutoRuntime }) else {
+            pcLogger.warning("[Transition] meshToStar fired but runtime is not AutoRuntime; ignoring")
+            return
+        }
+        pcLogger.info("[Transition] orchestrating mesh → star swap")
+        do {
+            try await auto.performTransition()
+        } catch {
+            pcLogger.error("[Transition] AutoRuntime.performTransition failed: \(String(describing: error), privacy: .public)")
+            return
+        }
+        // performTransition() swapped the inner runtime. The old transport is
+        // gone; the new transport is now reachable via runtime.transport.
+        guard let newTransport = lock.withLock({ self.runtime?.transport }) else {
+            pcLogger.error("[Transition] runtime.transport is nil after swap — cannot rebuild services")
+            return
+        }
+        lock.withLock { self.transport = newTransport }
+        await restartServices(transport: newTransport)
+        pcLogger.info("[Transition] services rebuilt against new transport")
     }
 
     /// Sends a command to a specific peer.
@@ -627,10 +751,13 @@ public final class PeerClock: @unchecked Sendable {
 
     // MARK: - Private: Coordination Loop
 
-    private func runCoordinationLoop(transport: any Transport) async {
+    private func runCoordinationLoop(peerStream: AsyncStream<[Peer]>) async {
         pcLogger.info("[CoordLoop] started, waiting for peers stream")
-        for await peers in transport.peers {
+        for await peerList in peerStream {
             guard !Task.isCancelled else { break }
+            // Fan-out subscription delivers `[Peer]`; coordination logic below
+            // is historically keyed on `Set<PeerID>`. Convert once at the top.
+            let peers = Set(peerList.map(\.id))
             pcLogger.info("[CoordLoop] peers update: \(peers.count) peers — \(peers.map { $0.description }.joined(separator: ", "), privacy: .public)")
 
             let (newPeerList, elec, eng, hb, prevKnown) = lock.withLock {
@@ -728,7 +855,9 @@ public final class PeerClock: @unchecked Sendable {
                 // 自分がコーディネーター: 同期エンジンを停止し、レスポンダーを起動
                 pcLogger.info("[CoordLoop] I am coordinator — starting sync responder")
                 await eng.stop()
-                startSyncResponder(transport: transport)
+                if let tr = lock.withLock({ self.transport }) {
+                    startSyncResponder(transport: tr)
+                }
             } else if let coordinator {
                 // 自分はフォロワー: レスポンダーを停止し、同期エンジンを起動
                 pcLogger.info("[CoordLoop] I am follower — starting NTP sync with coordinator \(coordinator.description, privacy: .public)")
@@ -830,6 +959,33 @@ public final class PeerClock: @unchecked Sendable {
     /// follow-up tech debt).
     public func testHook_injectConnectionEvent(_ event: ConnectionEvent) {
         connectionEventsContinuation.yield(event)
+    }
+
+    /// Test-only: count of times `restartServices(transport:)` has been called.
+    /// Starts at 0; initial `start()` increments to 1; each hot-swap increments
+    /// further. Guarded by `lock` for read/write safety.
+    public private(set) var testHook_restartCount: Int = 0
+
+    /// Test-only: inject a mesh → star transition on a running `.auto`
+    /// `PeerClock`. Awaits the full orchestration (`performTransition` +
+    /// `restartServices`) so callers can make assertions about post-swap state
+    /// without racing. Requires the instance to already be started on `.auto`.
+    public func testHook_forceMeshToStarTransition() async {
+        await performMeshToStarTransition()
+    }
+
+    /// Test-only: inject a fake peer count through the active `AutoRuntime`'s
+    /// settle path. Requires `.auto` topology and that `start()` has been called.
+    /// No-op if the active runtime isn't `AutoRuntime`.
+    public func testHook_injectAutoPeers(count: Int) {
+        guard let auto = lock.withLock({ runtime as? AutoRuntime }) else { return }
+        auto.testHook_injectDiscoveredPeers(count: count)
+    }
+
+    /// Test-only: string identifier of the current transport's concrete type
+    /// (e.g. "WiFiTransport", "StarTransport"). For asserting post-swap state.
+    public var testHook_currentTransportKind: String {
+        lock.withLock { transport }.map { String(describing: type(of: $0)) } ?? "nil"
     }
     #endif
 }
