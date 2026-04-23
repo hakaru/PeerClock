@@ -84,6 +84,16 @@ internal final class MeshRuntime: TopologyRuntime, @unchecked Sendable {
         }
         task?.cancel()
 
+        // Shutdown order:
+        //  1. transport.stop() closes the `transport.peers` producer — the
+        //     observer task's `for await` exits. (Already cancelled above, so
+        //     it won't drain buffered values; benign here because any "last
+        //     peer set before close" is not actionable.)
+        //  2. fanOut.finish() propagates terminal to current subscribers
+        //     (PeerClock.runCoordinationLoop, AutoRuntime) so their own
+        //     `for await` loops exit cleanly.
+        //  3. Other stream continuations are placeholders; finishing is
+        //     symmetric cleanup.
         await transport.stop()
         fanOut.finish()
         commandContinuation.finish()

@@ -290,21 +290,20 @@ public final class PeerClock: @unchecked Sendable {
         //    — a fresh start has nothing to tear down and this is a no-op.
         await teardownServices()
 
-        // 2. Subscribe to the current runtime's connectionEvents. We resubscribe
-        //    on every swap so post-swap handshake failures surface on
+        // 2. Subscribe to the current runtime's connectionEvents and rebuild
+        //    services in a single critical section. Rewiring connectionEvents
+        //    on every swap means post-swap handshake failures surface on
         //    `PeerClock.connectionEvents`.
-        let rt = lock.withLock { self.runtime }
         let connEventsCont = self.connectionEventsContinuation
-        let eventsForwardTask: Task<Void, Never>? = rt.map { runtime in
-            Task {
-                for await event in runtime.connectionEvents {
-                    connEventsCont.yield(event)
+        lock.withLock {
+            let eventsForwardTask: Task<Void, Never>? = self.runtime.map { runtime in
+                Task {
+                    for await event in runtime.connectionEvents {
+                        connEventsCont.yield(event)
+                    }
                 }
             }
-        }
 
-        // 3. Rebuild services against `transport`.
-        lock.withLock {
             self.transport = transport
 
             let elec = CoordinatorElection(localPeerID: localPeerID)
