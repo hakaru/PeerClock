@@ -4,3 +4,6 @@ xcuserdata/
 *.xcuserstate
 *.xcodeproj/
 App/*/build/
+
+# Auto-generated session-state files (claude-mem plugin etc.)
+AGENTS.md
