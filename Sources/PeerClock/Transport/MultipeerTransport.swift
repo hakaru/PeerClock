@@ -38,7 +38,7 @@ public final class MultipeerTransport: NSObject, Transport, @unchecked Sendable 
     public func start() async throws {
         let displayName = MultipeerIdentity.encode(localPeerID)
         let mcID = MultipeerPeerIDStore.loadOrCreate(displayName: displayName)
-        let session = MCSession(peer: mcID, securityIdentity: nil, encryptionPreference: .optional)
+        let session = MCSession(peer: mcID, securityIdentity: nil, encryptionPreference: .required)
         session.delegate = self
         let advertiser = MCNearbyServiceAdvertiser(peer: mcID, discoveryInfo: nil, serviceType: configuration.mcServiceType)
         advertiser.delegate = self
